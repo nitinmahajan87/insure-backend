@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from app.api.v1.endpoints import ingestion  # Existing (Files)
+from app.api.v1.endpoints import ingestion, delivery  # Existing (Files)
 from app.api.v1.endpoints import stream     # NEW (Real-Time JSON)
 
 app = FastAPI(title="InsureBackend Enterprise API")
@@ -11,7 +11,8 @@ app.include_router(ingestion.router, prefix="/api/v1", tags=["Batch Ingestion"])
 # 2. Register Stream Router (Real-Time JSON)
 # URL: POST /api/v1/stream/add
 app.include_router(stream.router, prefix="/api/v1/stream", tags=["Real-Time Stream"])
-
+# Wire up the new delivery router
+app.include_router(delivery.router, prefix="/api/v1/delivery", tags=["Outbound Delivery"])
 @app.get("/")
 def health_check():
     return {"status": "active", "system": "InsureBackend", "mode": "Multi-Tenant"}

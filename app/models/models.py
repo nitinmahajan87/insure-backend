@@ -24,12 +24,15 @@ class DeliveryChannel(enum.Enum):
     OFFLINE = "offline"
     BOTH = "both"
 
-class SyncStatus(enum.Enum):
-    PENDING = "pending"
-    PROVISIONING = "provisioning"
-    ACTIVE = "active"
-    FAILED = "failed"
-    COMPLETED_OFFLINE = "completed_offline"
+class SyncStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    PROVISIONING = "PROVISIONING"
+    ACTIVE = "ACTIVE"
+    FAILED = "FAILED"
+    COMPLETED_OFFLINE = "COMPLETED_OFFLINE"
+    PENDING_OFFLINE = "PENDING_OFFLINE"
+    COMPLETED_BOTH = "COMPLETED_BOTH"
+    PENDING_BOTH = "PENDING_BOTH"
 
 class Broker(Base, AuditMixin):
     __tablename__ = "brokers"
@@ -46,13 +49,15 @@ class Corporate(Base, AuditMixin):
     broker_id = Column(String, ForeignKey("brokers.id"))
     name = Column(String, nullable=False)
     webhook_url = Column(String)
-    insurer_format = Column(String, default="json")
+    insurer_provider = Column(String, default="standard")  # e.g., 'hdfc_ergo', 'icici'
+    insurer_format = Column(String, default="json") # 'json', 'xml', 'csv', 'excel'
     delivery_channel = Column(Enum(DeliveryChannel), default=DeliveryChannel.WEBHOOK)
     base_folder = Column(String, default="outbound_files/default")
     last_report_path = Column(String, nullable=True)
 
     broker = relationship("Broker", back_populates="corporates")
     api_keys = relationship("ApiKey", back_populates="corporate")
+    hrms_provider = Column(String, default="standard", server_default="standard")
     employees = relationship("Employee", back_populates="corporate")
     users = relationship("User", back_populates="corporate")  # Link to Users
 

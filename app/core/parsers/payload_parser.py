@@ -3,6 +3,28 @@ from xml.parsers.expat import ExpatError
 from fastapi import Request, HTTPException
 
 
+def clean_xml_dict(data):
+    """
+    Recursively removes XML namespaces (e.g., 'ns1:EmpID' -> 'EmpID')
+    and ignores XML attributes (keys starting with '@').
+    """
+    if isinstance(data, dict):
+        clean_dict = {}
+        for k, v in data.items():
+            # Ignore XML attributes entirely
+            if k.startswith('@'):
+                continue
+
+            # Strip namespace prefix if it exists
+            clean_key = k.split(':')[-1] if ':' in k else k
+            clean_dict[clean_key] = clean_xml_dict(v)
+        return clean_dict
+    elif isinstance(data, list):
+        return [clean_xml_dict(item) for item in data]
+    else:
+        return data
+
+
 async def universal_payload_parser(request: Request) -> dict:
     """
     Reads the incoming request, checks the Content-Type,
@@ -25,22 +47,29 @@ async def universal_payload_parser(request: Request) -> dict:
             raise HTTPException(status_code=400, detail="Empty XML payload")
 
         try:
-            # xmltodict converts XML tags directly into dictionary keys
             parsed_xml = xmltodict.parse(raw_body)
 
             if not parsed_xml:
-                return {}  # Return empty dict if XML had no meaningful nodes
+                return {}
 
-            # XML always has a "Root" tag.
-            # We want the data *inside* the root tag so it matches our Pydantic model.
             root_key = list(parsed_xml.keys())[0]
             data_dict = parsed_xml[root_key]
 
-            # If the root tag was empty (e.g. <EmployeeEvent/>), data_dict might be None.
-            return data_dict if data_dict is not None else {}
+            # 1. FIX: Ensure the payload is an object, not just a string
+            if not isinstance(data_dict, dict):
+                return {}
+
+            # 2. FIX: Clean the dictionary of namespaces and attributes
+            clean_dict = clean_xml_dict(data_dict)
+
+            # 3. FIX: Handle nested wrappers (e.g., <Event><Employee>...</Employee></Event>)
+            # If the root element just wrapped one single object, unwrap it one more level.
+            if len(clean_dict) == 1 and isinstance(list(clean_dict.values())[0], dict):
+                return list(clean_dict.values())[0]
+
+            return clean_dict
 
         except ExpatError as e:
-            # Explicitly catch XML syntax errors
             raise HTTPException(status_code=400, detail=f"Malformed XML: {str(e)}")
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error parsing XML payload: {str(e)}")

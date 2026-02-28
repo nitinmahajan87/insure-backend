@@ -1,7 +1,10 @@
+import json
+
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal  # Standard Sync Session
+from app.core.outbound.factory import get_insurer_adapter
 from app.models.models import SyncLog, Corporate, Employee, SyncStatus, DeliveryChannel
-from app.services.insurer_connector import InsurerConnector
+from app.services.insurer_connector import InsurerConnector, INSURER_API_KEY
 from datetime import datetime
 import logging
 
@@ -30,22 +33,46 @@ def process_sync_event(self, log_id: int):
             Employee.employee_code == emp_code
         ).first()
 
+        is_addition = log.transaction_type in ["ADDITION", "BATCH_ADDITION"]
+        is_batch = log.transaction_type in ["BATCH_ADDITION", "BATCH_DELETION"]
+
         # 3. ROUTE BY DELIVERY CHANNEL
         if corporate.delivery_channel in [DeliveryChannel.WEBHOOK, DeliveryChannel.BOTH]:
             try:
+
+                # A. Get the right Outbound Adapter
+                insurer_provider = getattr(corporate, 'insurer_provider', 'standard')
+                adapter = get_insurer_adapter(insurer_provider)
+
+                # B. Transform the payload
+                #is_addition = log.transaction_type == "ADDITION" or log.transaction_type == "BATCH_ADDITION"
+                if is_addition:
+                    final_data = adapter.transform_addition(log.payload)
+                else:
+                    final_data = adapter.transform_deletion(log.payload)
+
+                # Ensure JSON is dumped to string if the adapter returned a dict
+                if isinstance(final_data, dict):
+                    final_data = json.dumps(final_data)
+
+                # C. Get specific headers
+                headers = adapter.get_headers(api_key=INSURER_API_KEY)
+
                 # Use the new Sync wrapper
                 response_data = InsurerConnector.push_to_insurer_sync(
-                    payload=log.payload,
+                    data= final_data,
                     target_url=corporate.webhook_url,
-                    format_type=corporate.insurer_format
+                    headers=headers
                 )
                 log.raw_response = response_data
-                log.sync_status = SyncStatus.ACTIVE
-
-                if employee:
-                    # If it was a deletion, we might mark as FAILED or handle differently,
-                    # but for now, we follow your logic to mark as ACTIVE (synced)
-                    employee.sync_status = SyncStatus.ACTIVE
+                if corporate.delivery_channel == DeliveryChannel.BOTH:
+                    log.sync_status = SyncStatus.PENDING_BOTH
+                    if employee:
+                        employee.sync_status = SyncStatus.PENDING_BOTH
+                else:
+                    log.sync_status = SyncStatus.ACTIVE  # Standard webhook success
+                    if employee:
+                        employee.sync_status = SyncStatus.ACTIVE
 
             except Exception as exc:
                 log.retry_count += 1
@@ -55,10 +82,16 @@ def process_sync_event(self, log_id: int):
                 raise self.retry(exc=exc)
 
         elif corporate.delivery_channel == DeliveryChannel.OFFLINE:
-            # Mark as completed (File was generated during upload)
-            log.sync_status = SyncStatus.COMPLETED_OFFLINE
-            if employee:
-                employee.sync_status = SyncStatus.COMPLETED_OFFLINE
+            if is_batch:
+                # File was already generated synchronously in ingestion.py
+                log.sync_status = SyncStatus.COMPLETED_OFFLINE
+                if employee:
+                    employee.sync_status = SyncStatus.COMPLETED_OFFLINE
+            else:
+                # Real-time stream event. Park it for the Sweeper API.
+                log.sync_status = SyncStatus.PENDING_OFFLINE
+                if employee:
+                    employee.sync_status = SyncStatus.PENDING_OFFLINE
         # Final commit for success
         db.commit()
         return f"Processed log {log_id} successfully"

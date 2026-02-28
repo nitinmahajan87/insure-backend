@@ -6,7 +6,8 @@ from datetime import datetime
 from app.core.database import get_db
 from app.core.security import get_current_tenant, TenantContext
 from app.models.stream_schemas import AddEmployeeRequest, RemoveEmployeeRequest
-from app.core.adapter import universal_payload_parser
+from app.core.parsers.payload_parser import universal_payload_parser
+from app.core.adapters.factory import get_hrms_adapter
 from app.services.employee_service import record_employee_event
 from app.tasks.sync_tasks import process_sync_event
 
@@ -19,9 +20,22 @@ async def stream_addition(
     db: AsyncSession = Depends(get_db)
 ):
     try:
+        # STEP 1: Format Parsing (JSON/XML -> Dict)
         raw_dict = await universal_payload_parser(request)
+
+        # 🚨 ADD THESE TWO LINES 🚨
+        print(f"🕵️ RAW DICT OUTPUT: {raw_dict}")
+        print(f"🕵️ ROUTING TO ADAPTER: {getattr(tenant.corporate, 'hrms_provider', 'standard')}")
+
+        # STEP 2: Schema Normalization (Vendor Dict -> Standard Dict)
+        provider = getattr(tenant.corporate, 'hrms_provider', 'standard')
+        adapter = get_hrms_adapter(provider)
+        normalized_dict = adapter.normalize_addition(raw_dict)
+
+
         try:
-            payload = AddEmployeeRequest(**raw_dict)
+            # STEP 3: Pydantic Validation
+            payload = AddEmployeeRequest(**normalized_dict)
         except ValidationError as e:
             raise HTTPException(status_code=422, detail=e.errors())
 
@@ -39,7 +53,7 @@ async def stream_addition(
 
         return {
             "status": "accepted",
-            "message": f"Addition for {payload.employee_code} queued.",
+            "message": f"Addition for {payload.employee_code} queued. via {provider} adapter.",
             "tracking_id": log_entry.id
         }
     except Exception as e:
@@ -54,8 +68,14 @@ async def stream_removal(
 ):
     try:
         raw_dict = await universal_payload_parser(request)
+
+        # STEP 2: Schema Normalization (Vendor Dict -> Standard Dict)
+        provider = getattr(tenant.corporate, 'hrms_provider', 'standard')
+        adapter = get_hrms_adapter(provider)
+        normalized_dict = adapter.normalize_deletion(raw_dict)
+
         try:
-            payload = RemoveEmployeeRequest(**raw_dict)
+            payload = RemoveEmployeeRequest(**normalized_dict)
         except ValidationError as e:
             raise HTTPException(status_code=422, detail=e.errors())
 
@@ -73,7 +93,7 @@ async def stream_removal(
 
         return {
             "status": "accepted",
-            "message": f"Removal for {payload.employee_code} queued.",
+            "message": f"Removal for {payload.employee_code} queued. via {provider} adapter.",
             "tracking_id": log_entry.id
         }
     except Exception as e:

@@ -39,7 +39,7 @@ async def upload_additions(
         excel_url = ""
         excel_filename = ""
         if tenant.corporate.delivery_channel in [DeliveryChannel.OFFLINE, DeliveryChannel.BOTH]:
-            excel_filename = f"addition_report_{uuid.uuid4().hex[:8]}.xlsx"
+            # excel_filename = f"addition_report_{uuid.uuid4().hex[:8]}.xlsx"
 
             # 1. Join the absolute path: /app/outbound_files + wipro
             full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
@@ -47,10 +47,16 @@ async def upload_additions(
             # 2. Ensure folder exists
             os.makedirs(full_directory, exist_ok=True)
 
-            # 3. Final Absolute Path for the generator
-            full_file_path = os.path.join(full_directory, excel_filename)
-            # 4. Generate the file
-            excel_path = OutboundTransformer.to_excel(report, full_file_path)
+            # Extract dictionaries from Pydantic models
+            dict_data = [r.model_dump() for r in report.additions]
+
+            # Use the generic to_file method
+            excel_path, excel_filename = OutboundTransformer.to_file(
+                data=dict_data,
+                filename_prefix="addition_report",
+                output_dir=full_directory,
+                format_type=tenant.corporate.insurer_format # 'csv' or 'excel'
+            )
 
             # 5. Fix the URL (Ensure no "N/A" and no broken slashes)
             excel_url = str(request.url_for("download_outbound_file", file_name=excel_filename))
@@ -98,18 +104,23 @@ async def upload_deletions(
         excel_url = ""
         excel_filename = ""
         if tenant.corporate.delivery_channel in [DeliveryChannel.OFFLINE, DeliveryChannel.BOTH]:
-            excel_filename = f"deletion_report_{uuid.uuid4().hex[:8]}.xlsx"
+            # excel_filename = f"deletion_report_{uuid.uuid4().hex[:8]}.xlsx"
 
             # 1. Join the absolute path: /app/outbound_files + wipro
             full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
 
             # 2. Ensure folder exists
             os.makedirs(full_directory, exist_ok=True)
+            # Extract dictionaries from Pydantic models
+            dict_data = [r.model_dump() for r in report.deletions]
 
-            # 3. Final Absolute Path for the generator
-            full_file_path = os.path.join(full_directory, excel_filename)
-
-            excel_path = OutboundTransformer.to_excel(report,full_file_path)
+            # Use the generic to_file method
+            excel_path, excel_filename = OutboundTransformer.to_file(
+                data=dict_data,
+                filename_prefix="removal_report",
+                output_dir=full_directory,
+                format_type=tenant.corporate.insurer_format  # 'csv' or 'excel'
+            )
 
             excel_url = str(request.url_for("download_outbound_file", file_name=excel_filename))
 
