@@ -1,0 +1,37 @@
+# Web Server & Framework
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# Database & ORM
+sqlalchemy==2.0.47
+asyncpg==0.31.0
+psycopg2-binary==2.9.11
+alembic==1.18.4
+
+# Task Queue & Broker
+celery==5.3.6
+redis==5.0.1
+
+# Validation & Settings
+pydantic==2.12.5
+pydantic-settings==2.1.0
+passlib==1.7.4
+
+# HTTP & Integration
+httpx==0.26.0
+requests==2.31.0
+xmltodict==0.13.0
+zeep==4.2.1
+
+# Data Processing
+pandas==2.2.0
+polars==0.20.10
+openpyxl==3.1.2
+numpy==1.26.4
+XlsxWriter==3.1.9
+
+# Utils
+python-dotenv==1.2.1
+python-dateutil==2.9.0.post0
+pytz==2025.2

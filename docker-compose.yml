@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  insurtech_db:
+    image: postgres:16
+    container_name: insurtech_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: insurtech_gateway
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - insurtech_net
+
+  redis:
+    image: redis:alpine
+    container_name: insurtech_redis
+    ports:
+      - "6380:6379"
+    networks:
+      - insurtech_net
+
+  # The FastAPI Web Server
+  api:
+    build: .
+    container_name: insurtech_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - .:/app
+      - ./outbound_files:/app/outbound_files
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    depends_on:
+      - insurtech_db
+      - redis
+    networks:
+      - insurtech_net
+
+  # NEW: The Celery Worker
+  worker:
+    build: .
+    container_name: insurtech_worker
+    volumes:
+      - .:/app
+      - ./outbound_files:/app/outbound_files
+    # Command to start Celery instead of Uvicorn
+    command: celery -A app.core.celery_app worker --loglevel=info
+    env_file:
+      - .env
+    depends_on:
+      - insurtech_db
+      - redis
+    networks:
+      - insurtech_net
+
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: insurtech_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80" # Access pgAdmin at http://localhost:5050
+    depends_on:
+      - insurtech_db
+    networks:
+      - insurtech_net
+
+networks:
+  insurtech_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
