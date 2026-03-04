@@ -1,5 +1,11 @@
+import logging
+from typing import Dict, Any, Optional
+
+import requests
+
 from app.core.outbound.base import BaseInsurerAdapter
-from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
 
 
 class HdfcErgoAdapter(BaseInsurerAdapter):
@@ -47,3 +53,54 @@ class HdfcErgoAdapter(BaseInsurerAdapter):
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
+
+    # HDFC Ergo status values → our normalised vocabulary
+    _STATUS_MAP = {
+        "ENROLLED": "APPROVED",
+        "ACTIVE":   "APPROVED",
+        "REJECTED": "REJECTED",
+        "DECLINED": "REJECTED",
+        "PENDING":  "PENDING",
+    }
+
+    def check_policy_status(
+        self, transaction_id: str, api_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Polls HDFC Ergo's status endpoint using the Idempotency-Key we sent
+        them as the reference ID (requestRefId).
+
+        HDFC Ergo JSON response shape (representative):
+          {
+            "requestRefId": "...",
+            "policyStatus": "ENROLLED" | "REJECTED" | "PENDING",
+            "policyId":     "HDFC-POL-2024-XXXXX",
+            "policyNumber": "P0012345",
+            "startDate":    "2024-04-01",
+            "rejectionReason": null | "OVER_AGE_LIMIT"
+          }
+        """
+        try:
+            resp = requests.get(
+                f"https://api.hdfcergo.com/policy/status/{transaction_id}",
+                headers=self.get_headers(api_key),
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            raw_status = data.get("policyStatus", "PENDING")
+            normalised = self._STATUS_MAP.get(raw_status.upper(), "PENDING")
+
+            return {
+                "status":               normalised,
+                "insurer_reference_id": data.get("policyId"),
+                "policy_number":        data.get("policyNumber"),
+                "policy_effective_date": data.get("startDate"),
+                "rejection_reason":     data.get("rejectionReason"),
+            }
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                f"HDFC Ergo status poll failed for tx '{transaction_id}': {exc}"
+            )
+            return None

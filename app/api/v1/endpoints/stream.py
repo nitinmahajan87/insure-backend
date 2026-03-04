@@ -5,6 +5,7 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.core.security import get_current_tenant, TenantContext
+from app.models.models import SyncSource
 from app.models.stream_schemas import AddEmployeeRequest, RemoveEmployeeRequest
 from app.core.parsers.payload_parser import universal_payload_parser
 from app.core.adapters.factory import get_hrms_adapter
@@ -44,7 +45,8 @@ async def stream_addition(
             db=db,
             corporate_id=tenant.corporate.id,
             employee_data=payload.model_dump(),
-            event_type="ADDITION"
+            event_type="ADDITION",
+            source = SyncSource.ONLINE
         )
         await db.commit() # Save to DB first
 
@@ -84,7 +86,8 @@ async def stream_removal(
             db=db,
             corporate_id=tenant.corporate.id,
             employee_data=payload.model_dump(),
-            event_type="DELETION"
+            event_type="DELETION",
+            source=SyncSource.ONLINE,
         )
         await db.commit()
 

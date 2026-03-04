@@ -1,7 +1,7 @@
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import AsyncSessionLocal, engine
-from app.models.models import Broker, Corporate, User, ApiKey, DeliveryChannel
+from app.models.models import Broker, Corporate, User, ApiKey, DeliveryChannel, ApiKeyScope
 import uuid
 
 async def seed_data():
@@ -52,9 +52,11 @@ async def seed_data():
             session.add_all([hr_infosys, hr_wipro])
 
             # 4. Create API Keys
-            key1 = ApiKey(key="sk_live_infosys_001", corporate_id="corp_infosys", is_active=True)
-            key2 = ApiKey(key="sk_live_wipro_999", corporate_id="corp_wipro", is_active=True)
-            session.add_all([key1, key2])
+            key1 = ApiKey(key="sk_live_infosys_001", corporate_id="corp_infosys", is_active=True, scope=ApiKeyScope.CORPORATE)
+            key2 = ApiKey(key="sk_live_wipro_999", corporate_id="corp_wipro", is_active=True, scope=ApiKeyScope.CORPORATE)
+            # Broker-admin key: can manage all corporates under brk_marsh
+            key_broker_marsh = ApiKey(key="sk_broker_marsh_admin", broker_id="brk_marsh", is_active=True, scope=ApiKeyScope.BROKER)
+            session.add_all([key1, key2, key_broker_marsh])
 
         print("✅ Database seeded successfully!")
 

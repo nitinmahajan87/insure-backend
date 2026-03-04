@@ -1,8 +1,8 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 import os
-import uuid
 from starlette.responses import FileResponse
+from celery import group as celery_group
 
 from app.core.database import get_db
 from app.core.security import get_current_tenant, TenantContext
@@ -11,9 +11,8 @@ from app.core.processor import process_additions, process_deletions
 from app.services.outbound_service import OutboundTransformer
 from app.models.schemas import IngestionResponse
 from app.services.employee_service import record_employee_event
-from app.tasks.sync_tasks import process_sync_event
-from app.models.models import DeliveryChannel
-from fastapi import Request
+from app.tasks.sync_tasks import CHUNK_SIZE, process_batch_chunk
+from app.models.models import DeliveryChannel, SyncSource
 router = APIRouter()
 
 BASE_PATH = os.getenv("BASE_OUTBOUND_PATH", "/app/outbound_files")
@@ -35,52 +34,47 @@ async def upload_additions(
         # 1. Parse the file
         report = process_additions(temp_path)
 
-        # 2. Generate a consolidated report file if the channel requires it
+        # 2. Generate the outbound file upfront for OFFLINE / BOTH channels.
         excel_url = ""
         excel_filename = ""
         if tenant.corporate.delivery_channel in [DeliveryChannel.OFFLINE, DeliveryChannel.BOTH]:
-            # excel_filename = f"addition_report_{uuid.uuid4().hex[:8]}.xlsx"
-
-            # 1. Join the absolute path: /app/outbound_files + wipro
             full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
-
-            # 2. Ensure folder exists
             os.makedirs(full_directory, exist_ok=True)
-
-            # Extract dictionaries from Pydantic models
             dict_data = [r.model_dump() for r in report.additions]
-
-            # Use the generic to_file method
-            excel_path, excel_filename = OutboundTransformer.to_file(
+            _, excel_filename = OutboundTransformer.to_file(
                 data=dict_data,
                 filename_prefix="addition_report",
                 output_dir=full_directory,
-                format_type=tenant.corporate.insurer_format # 'csv' or 'excel'
+                format_type=tenant.corporate.insurer_format,
             )
-
-            # 5. Fix the URL (Ensure no "N/A" and no broken slashes)
             excel_url = str(request.url_for("download_outbound_file", file_name=excel_filename))
 
         # 3. Process rows and Queue Tasks for API Sync
+        # --- PHASE 1: BULK PERSIST (replaces sequential for loop) ---
+        log_ids = []
         for addition in report.additions:
             log_entry = await record_employee_event(
                 db=db,
                 corporate_id=tenant.corporate.id,
                 employee_data=addition.model_dump(),
-                event_type="BATCH_ADDITION"
+                event_type="BATCH_ADDITION",
+                source=SyncSource.BATCH,
             )
-            # Link the generated file to the log if applicable
             if excel_url:
                 log_entry.file_path = f"{tenant.corporate.base_folder}/{excel_filename}"
+            log_ids.append(log_entry.id)
 
-            # Send to Celery worker
-            process_sync_event.delay(log_entry.id)
-
+        # Phase 1 commit: all rows persisted before workers start.
         await db.commit()
+
+        # Phase 2: fan-out — one Celery worker per chunk of CHUNK_SIZE rows.
+        chunks = [log_ids[i:i + CHUNK_SIZE] for i in range(0, len(log_ids), CHUNK_SIZE)]
+        celery_group(process_batch_chunk.s(chunk) for chunk in chunks).apply_async()
 
         return IngestionResponse(
             filename=file.filename,
-            message=f"{len(report.additions)} records queued for processing.",
+            message=f"{len(report.additions)} records persisted. "
+                    f"{len(chunks)} parallel workers dispatched.",
             report=report,
             api_payload={},
             excel_download_url=excel_url
@@ -104,45 +98,44 @@ async def upload_deletions(
         excel_url = ""
         excel_filename = ""
         if tenant.corporate.delivery_channel in [DeliveryChannel.OFFLINE, DeliveryChannel.BOTH]:
-            # excel_filename = f"deletion_report_{uuid.uuid4().hex[:8]}.xlsx"
-
-            # 1. Join the absolute path: /app/outbound_files + wipro
             full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
-
-            # 2. Ensure folder exists
             os.makedirs(full_directory, exist_ok=True)
-            # Extract dictionaries from Pydantic models
             dict_data = [r.model_dump() for r in report.deletions]
-
-            # Use the generic to_file method
-            excel_path, excel_filename = OutboundTransformer.to_file(
+            _, excel_filename = OutboundTransformer.to_file(
                 data=dict_data,
                 filename_prefix="removal_report",
                 output_dir=full_directory,
-                format_type=tenant.corporate.insurer_format  # 'csv' or 'excel'
+                format_type=tenant.corporate.insurer_format,
             )
-
             excel_url = str(request.url_for("download_outbound_file", file_name=excel_filename))
 
+        # Phase 1: bulk persist all rows in one transaction.
+        log_ids = []
         for deletion in report.deletions:
             log_entry = await record_employee_event(
                 db=db,
                 corporate_id=tenant.corporate.id,
                 employee_data=deletion.model_dump(),
-                event_type="BATCH_DELETION"
+                event_type="BATCH_DELETION",
+                source=SyncSource.BATCH,
             )
             if excel_url:
                 log_entry.file_path = f"{tenant.corporate.base_folder}/{excel_filename}"
-
-            process_sync_event.delay(log_entry.id)
+            log_ids.append(log_entry.id)
 
         await db.commit()
+
+        # Phase 2: fan-out — one Celery worker per chunk of CHUNK_SIZE rows.
+        chunks = [log_ids[i:i + CHUNK_SIZE] for i in range(0, len(log_ids), CHUNK_SIZE)]
+        celery_group(process_batch_chunk.s(chunk) for chunk in chunks).apply_async()
+
         return IngestionResponse(
             filename=file.filename,
-            message=f"{len(report.deletions)} deletions queued.",
+            message=f"{len(report.deletions)} records persisted. "
+                    f"{len(chunks)} parallel workers dispatched.",
             report=report,
             api_payload={},
-            excel_download_url=excel_url
+            excel_download_url=excel_url,
         )
     except Exception as e:
         await db.rollback()

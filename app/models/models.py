@@ -24,15 +24,35 @@ class DeliveryChannel(enum.Enum):
     OFFLINE = "offline"
     BOTH = "both"
 
+
 class SyncStatus(str, enum.Enum):
     PENDING = "PENDING"
     PROVISIONING = "PROVISIONING"
-    ACTIVE = "ACTIVE"
+    ACTIVE = "ACTIVE"  # Delivered to insurer
     FAILED = "FAILED"
+    SOFT_REJECTED = "SOFT_REJECTED"  # NEW: Insurer accepted receipt but rejected data later
     COMPLETED_OFFLINE = "COMPLETED_OFFLINE"
     PENDING_OFFLINE = "PENDING_OFFLINE"
     COMPLETED_BOTH = "COMPLETED_BOTH"
     PENDING_BOTH = "PENDING_BOTH"
+
+
+class ApiKeyScope(str, enum.Enum):  # NEW ENUM
+    CORPORATE = "CORPORATE"  # Current behavior: scoped to one corporate
+    BROKER = "BROKER"  # New: broker-admin, manages all its corporates
+
+
+class PolicyStatus(str, enum.Enum):  # NEW ENUM
+    PENDING_ISSUANCE = "PENDING_ISSUANCE"  # Sent, awaiting confirmation
+    ISSUED = "ISSUED"  # Insurer confirmed coverage
+    SOFT_REJECTED = "SOFT_REJECTED"  # Business rule failure (age limit, etc.)
+    LAPSED = "LAPSED"  # Coverage ended
+    CANCELLED = "CANCELLED"
+
+#Differentiate API vs File Uploads
+class SyncSource(str, enum.Enum):
+    ONLINE = "ONLINE"
+    BATCH = "BATCH"
 
 class Broker(Base, AuditMixin):
     __tablename__ = "brokers"
@@ -41,6 +61,7 @@ class Broker(Base, AuditMixin):
     allowed_formats = Column(JSON, default=["csv", "xlsx"])
 
     corporates = relationship("Corporate", back_populates="broker")
+    api_keys = relationship("ApiKey", back_populates="broker")  # NEW
 
 
 class Corporate(Base, AuditMixin):
@@ -77,10 +98,13 @@ class User(Base, AuditMixin):
 class ApiKey(Base, AuditMixin):
     __tablename__ = "api_keys"
     key = Column(String, primary_key=True)
-    corporate_id = Column(String, ForeignKey("corporates.id"))
+    corporate_id = Column(String, ForeignKey("corporates.id"), nullable=True)
+    broker_id = Column(String, ForeignKey("brokers.id"), nullable=True)
+    scope = Column(Enum(ApiKeyScope), default=ApiKeyScope.CORPORATE)  # NEW
     is_active = Column(Boolean, default=True)
 
     corporate = relationship("Corporate", back_populates="api_keys")
+    broker = relationship("Broker", back_populates="api_keys")  # NEW relationship
 
 
 # --- 2. Business Data (Census & Logs) ---
@@ -97,7 +121,13 @@ class Employee(Base, AuditMixin):
     policy_number = Column(String, nullable=True)
     status = Column(String, default="active")
     date_of_leaving = Column(Date, nullable=True)
-    sync_status = Column(Enum(SyncStatus), default=SyncStatus.PENDING)
+
+    delivery_status = Column(Enum(SyncStatus), default=SyncStatus.PENDING)
+    policy_status = Column(Enum(PolicyStatus), nullable=True)  # NEW
+
+    policy_effective_date = Column(Date, nullable=True)
+    insurer_reference_id = Column(String, nullable=True)  # insurer's internal ID
+    rejection_reason = Column(String, nullable=True)  # human-readable rejection
 
     corporate = relationship("Corporate", back_populates="employees")
 
@@ -109,6 +139,7 @@ class SyncLog(Base):
     transaction_id = Column(String, index=True, nullable=True)
     user_id = Column(String, ForeignKey("users.id"), nullable=True)  # Who triggered the sync?
     transaction_type = Column(String)
+    source = Column(Enum(SyncSource), nullable=False, default=SyncSource.ONLINE)
     payload = Column(JSON)
     status = Column(String)
     sync_status = Column(Enum(SyncStatus), default=SyncStatus.PENDING)
@@ -118,3 +149,21 @@ class SyncLog(Base):
     error_message = Column(String, nullable=True)
     file_path = Column(String, nullable=True)  # Path to offline CSV/Excel
     timestamp = Column(DateTime, server_default=func.now())
+
+    # --- PILLAR 1: Reconciliation fields ---
+    insurer_reference_id = Column(String, nullable=True, index=True)  # NEW
+    callback_received_at = Column(DateTime, nullable=True)  # NEW
+    rejection_reason = Column(String, nullable=True)  # NEW
+
+    events = relationship("SyncLogEvent", back_populates="sync_log", cascade="all, delete-orphan")
+
+class SyncLogEvent(Base):
+    __tablename__ = "sync_log_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    sync_log_id = Column(Integer, ForeignKey("sync_logs.id", ondelete="CASCADE"), index=True)
+    event_status = Column(Enum(SyncStatus), nullable=False)
+    actor = Column(String, nullable=False) # e.g., "HR_USER", "CELERY", "SYSTEM"
+    details = Column(JSON, nullable=True) # Context like errors or webhook IDs
+    timestamp = Column(DateTime, server_default=func.now())
+
+    sync_log = relationship("SyncLog", back_populates="events")

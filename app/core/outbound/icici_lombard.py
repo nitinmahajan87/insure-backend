@@ -1,6 +1,12 @@
-from app.core.outbound.base import BaseInsurerAdapter
-from typing import Dict, Any
+import logging
+from typing import Dict, Any, Optional
+
+import requests
 import xmltodict
+
+from app.core.outbound.base import BaseInsurerAdapter
+
+logger = logging.getLogger(__name__)
 
 
 class IciciLombardAdapter(BaseInsurerAdapter):
@@ -57,5 +63,66 @@ class IciciLombardAdapter(BaseInsurerAdapter):
         return {
             "X-ICICI-AuthToken": api_key,
             "Content-Type": "application/xml",
-            "Accept": "application/xml"
+            "Accept": "application/xml",
         }
+
+    # ICICI Lombard status values → our normalised vocabulary
+    _STATUS_MAP = {
+        "ISSUED":   "APPROVED",
+        "ACTIVE":   "APPROVED",
+        "REJECTED": "REJECTED",
+        "DECLINED": "REJECTED",
+        "PENDING":  "PENDING",
+        "INPROGRESS": "PENDING",
+    }
+
+    def check_policy_status(
+        self, transaction_id: str, api_key: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Polls ICICI Lombard's status endpoint for a given transaction.
+        ICICI uses a POST with an XML body and returns XML.
+
+        ICICI Lombard XML response shape (representative):
+          <PolicyStatusResponse>
+            <TransactionRef>...</TransactionRef>
+            <PolicyStatus>ISSUED | REJECTED | PENDING</PolicyStatus>
+            <PolicyId>IL-2024-XXXXX</PolicyId>
+            <PolicyNumber>IL0099887</PolicyNumber>
+            <EffectiveDate>2024-04-01</EffectiveDate>
+            <RejectionReason></RejectionReason>
+          </PolicyStatusResponse>
+        """
+        request_xml = xmltodict.unparse({
+            "PolicyStatusRequest": {
+                "TransactionRef": transaction_id,
+            }
+        }, pretty=True)
+
+        try:
+            resp = requests.post(
+                "https://api.icicilombard.com/group-health/policy/status",
+                data=request_xml,
+                headers=self.get_headers(api_key),
+                timeout=10,
+            )
+            resp.raise_for_status()
+
+            parsed = xmltodict.parse(resp.text)
+            body = parsed.get("PolicyStatusResponse", {})
+
+            raw_status = body.get("PolicyStatus", "PENDING")
+            normalised = self._STATUS_MAP.get(raw_status.upper(), "PENDING")
+
+            return {
+                "status":                normalised,
+                "insurer_reference_id":  body.get("PolicyId"),
+                "policy_number":         body.get("PolicyNumber"),
+                "policy_effective_date": body.get("EffectiveDate"),
+                "rejection_reason":      body.get("RejectionReason") or None,
+            }
+        except requests.exceptions.RequestException as exc:
+            logger.warning(
+                f"ICICI Lombard status poll failed for tx '{transaction_id}': {exc}"
+            )
+            return None

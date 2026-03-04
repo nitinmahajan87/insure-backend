@@ -1,6 +1,7 @@
 from celery import Celery
 import os
 from dotenv import load_dotenv
+from celery.schedules import crontab
 
 load_dotenv()
 
@@ -11,8 +12,19 @@ celery_app = Celery(
     "insurtech_tasks",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["app.tasks.sync_tasks"] # We will create this file next
+    include=[
+        "app.tasks.sync_tasks",
+        "app.tasks.reconciliation_tasks",
+    ],
 )
+
+celery_app.conf.beat_schedule = {
+      "reconcile-pending-syncs": {
+          "task": "app.tasks.reconciliation_tasks.reconcile_pending_syncs",
+          "schedule": crontab(minute=0),  # Every hour
+      },
+  }
+
 
 # Optional: Celery Configuration
 celery_app.conf.update(
