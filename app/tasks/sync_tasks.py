@@ -1,11 +1,13 @@
 import json
 import logging
-from typing import List
+from types import SimpleNamespace
+from typing import List, Optional
 
 from celery import group as celery_group
 
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
+from app.core.cache import cache_get, cache_set, CORPORATE_TTL
 from app.core.outbound.factory import get_insurer_adapter
 from app.models.models import (
     SyncLog, Corporate, Employee,
@@ -26,6 +28,47 @@ _TERMINAL_STATUSES = {
     SyncStatus.PENDING_BOTH,
     SyncStatus.SOFT_REJECTED,
 }
+
+
+# ---------------------------------------------------------------------------
+# Corporate cache helpers  (sync Redis — DB 1)
+# ---------------------------------------------------------------------------
+
+def _corporate_to_dict(c: Corporate) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "broker_id": c.broker_id,
+        "webhook_url": c.webhook_url,
+        "insurer_format": getattr(c, "insurer_format", "json"),
+        "delivery_channel": c.delivery_channel.value if c.delivery_channel else None,
+        "base_folder": getattr(c, "base_folder", ""),
+        "insurer_provider": getattr(c, "insurer_provider", "standard"),
+        "hrms_provider": getattr(c, "hrms_provider", "standard"),
+    }
+
+
+def _dict_to_corporate(d: dict) -> SimpleNamespace:
+    corp = SimpleNamespace(**d)
+    if d.get("delivery_channel"):
+        corp.delivery_channel = DeliveryChannel(d["delivery_channel"])
+    return corp
+
+
+def _get_corporate(db, corporate_id: str) -> Optional[SimpleNamespace]:
+    """
+    Fetch corporate by id. Checks Redis first; falls back to DB on miss.
+    Writes through to cache on DB hit.
+    """
+    cache_key = f"ins:corp:{corporate_id}"
+    cached = cache_get(cache_key)
+    if cached:
+        return _dict_to_corporate(cached)
+
+    corporate = db.query(Corporate).filter(Corporate.id == corporate_id).first()
+    if corporate:
+        cache_set(cache_key, _corporate_to_dict(corporate), CORPORATE_TTL)
+    return corporate
 
 
 # ---------------------------------------------------------------------------
@@ -58,7 +101,7 @@ def _process_single_log(db, log: SyncLog) -> None:
         logger.info(f"Log {log.id} already terminal ({log.sync_status}). Skipping.")
         return
 
-    corporate = db.query(Corporate).filter(Corporate.id == log.corporate_id).first()
+    corporate = _get_corporate(db, log.corporate_id)
     if not corporate:
         logger.warning(f"Log {log.id}: corporate {log.corporate_id} not found. Skipping.")
         return
@@ -203,7 +246,7 @@ def process_sync_event(self, log_id: int):
             logger.info(f"Log {log_id} already processed ({log.sync_status}). Skipping.")
             return f"Already processed: {log.sync_status}"
 
-        corporate = db.query(Corporate).filter(Corporate.id == log.corporate_id).first()
+        corporate = _get_corporate(db, log.corporate_id)
 
         log.sync_status = SyncStatus.PROVISIONING
         record_audit_event_sync(db, log.id, SyncStatus.PROVISIONING, "CELERY_WORKER")

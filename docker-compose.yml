@@ -27,7 +27,8 @@ services:
   api:
     build: .
     container_name: insurtech_api
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    # entrypoint.sh: waits for DB → runs alembic upgrade head → starts uvicorn
+    command: ["bash", "./entrypoint.sh"]
     volumes:
       - .:/app
       - ./outbound_files:/app/outbound_files
@@ -41,15 +42,29 @@ services:
     networks:
       - insurtech_net
 
-  # NEW: The Celery Worker
+  # Celery Worker (task processor)
   worker:
     build: .
     container_name: insurtech_worker
     volumes:
       - .:/app
       - ./outbound_files:/app/outbound_files
-    # Command to start Celery instead of Uvicorn
     command: celery -A app.core.celery_app worker --loglevel=info
+    env_file:
+      - .env
+    depends_on:
+      - insurtech_db
+      - redis
+    networks:
+      - insurtech_net
+
+  # Celery Beat (periodic task scheduler — hourly reconciliation sweep)
+  beat:
+    build: .
+    container_name: insurtech_beat
+    volumes:
+      - .:/app
+    command: celery -A app.core.celery_app beat --loglevel=info
     env_file:
       - .env
     depends_on:

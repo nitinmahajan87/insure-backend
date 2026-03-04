@@ -25,6 +25,8 @@ COPY . .
 # Create the outbound_files directory inside the container
 RUN mkdir -p /app/outbound_files
 
-# The command is overridden by docker-compose for the worker,
-# but we set the default for the API here
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Make the entrypoint executable
+RUN chmod +x /app/entrypoint.sh
+
+# Default command (overridden by docker-compose for worker/beat services)
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

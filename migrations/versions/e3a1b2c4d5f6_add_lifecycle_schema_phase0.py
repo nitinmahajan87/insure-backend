@@ -36,11 +36,19 @@ def upgrade() -> None:
     # ------------------------------------------------------------------
     # 1. Extend the existing syncstatus PostgreSQL enum.
     #
+    #    Migration f78ff425daf2 created syncstatus with only 5 values.
+    #    Migration 365001e83183 referenced PENDING_OFFLINE, COMPLETED_BOTH,
+    #    PENDING_BOTH in sa.Enum() Python-side but never issued ALTER TYPE,
+    #    so those values are missing from the live PG enum. Add them all
+    #    here along with SOFT_REJECTED (Pillar 1).
+    #
     #    ALTER TYPE ... ADD VALUE is transactional in PostgreSQL 12+ but
     #    the new value cannot be referenced (in defaults/constraints)
-    #    within the same transaction. We only add it here; it is used by
-    #    application code at runtime, which runs in separate transactions.
+    #    within the same transaction.
     # ------------------------------------------------------------------
+    op.execute(sa.text("ALTER TYPE syncstatus ADD VALUE IF NOT EXISTS 'PENDING_OFFLINE'"))
+    op.execute(sa.text("ALTER TYPE syncstatus ADD VALUE IF NOT EXISTS 'COMPLETED_BOTH'"))
+    op.execute(sa.text("ALTER TYPE syncstatus ADD VALUE IF NOT EXISTS 'PENDING_BOTH'"))
     op.execute(sa.text("ALTER TYPE syncstatus ADD VALUE IF NOT EXISTS 'SOFT_REJECTED'"))
 
     # ------------------------------------------------------------------
