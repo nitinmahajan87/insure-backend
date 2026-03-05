@@ -116,11 +116,15 @@ class Employee(Base, AuditMixin):
     employee_code = Column(String, nullable=False, index=True)
     first_name = Column(String)
     last_name = Column(String)
+    email = Column(String, nullable=True)
+    gender = Column(String, nullable=True)
+    date_of_birth = Column(Date, nullable=True)
     date_of_joining = Column(Date, nullable=True)
     sum_insured = Column(Float)
     policy_number = Column(String, nullable=True)
     status = Column(String, default="active")
     date_of_leaving = Column(Date, nullable=True)
+    resignation_reason = Column(String, nullable=True)
 
     delivery_status = Column(Enum(SyncStatus), default=SyncStatus.PENDING)
     policy_status = Column(Enum(PolicyStatus), nullable=True)  # NEW
@@ -151,9 +155,16 @@ class SyncLog(Base):
     timestamp = Column(DateTime, server_default=func.now())
 
     # --- PILLAR 1: Reconciliation fields ---
-    insurer_reference_id = Column(String, nullable=True, index=True)  # NEW
-    callback_received_at = Column(DateTime, nullable=True)  # NEW
-    rejection_reason = Column(String, nullable=True)  # NEW
+    insurer_reference_id = Column(String, nullable=True, index=True)
+    callback_received_at = Column(DateTime, nullable=True)
+    rejection_reason = Column(String, nullable=True)
+
+    # Snapshot of policy_status at the time this log was processed.
+    # Prevents bleed: employee.policy_status changes over time but log history must be immutable.
+    policy_status = Column(String, nullable=True)
+
+    # True when HR explicitly bypassed the "not enrolled" guard (force-removal escape hatch).
+    is_force = Column(Boolean, default=False, nullable=False)
 
     events = relationship("SyncLogEvent", back_populates="sync_log", cascade="all, delete-orphan")
 
@@ -164,6 +175,8 @@ class SyncLogEvent(Base):
     event_status = Column(Enum(SyncStatus), nullable=False)
     actor = Column(String, nullable=False) # e.g., "HR_USER", "CELERY", "SYSTEM"
     details = Column(JSON, nullable=True) # Context like errors or webhook IDs
+    # Set only when this event caused a policy_status transition (null = no change)
+    policy_status = Column(String, nullable=True)
     timestamp = Column(DateTime, server_default=func.now())
 
     sync_log = relationship("SyncLog", back_populates="events")

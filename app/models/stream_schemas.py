@@ -20,9 +20,15 @@ class AddEmployeeRequest(EmployeeEvent):
     sum_insured: float = 0.0
 
     @field_validator('date_of_birth')
-    def check_age(cls, v):
-        if v.year > date.today().year:
+    def check_dob(cls, v):
+        if v and v > date.today():
             raise ValueError('Date of birth cannot be in the future')
+        return v
+
+    @field_validator('date_of_joining')
+    def check_doj(cls, v):
+        if v > date.today():
+            raise ValueError('Date of joining cannot be in the future')
         return v
 
 # 2. Payload for Removing an Employee (Real-Time)

@@ -48,14 +48,16 @@ async def get_transactions(
             {
                 "id": log.id,
                 "transaction_type": log.transaction_type,
-                "source": log.source,  # 👈 Added Source (ONLINE/BATCH)
+                "source": log.source,
                 "employee_code": log.payload.get("employee_code"),
                 "status": log.sync_status,
+                "policy_status": log.policy_status,
                 "insurer_reference_id": log.insurer_reference_id,
                 "rejection_reason": log.rejection_reason,
                 "callback_received_at": log.callback_received_at,
                 "timestamp": log.timestamp,
-                "raw_response": log.raw_response
+                "raw_response": log.raw_response,
+                "is_force": log.is_force,
             }
             for log in logs
         ],
@@ -157,6 +159,68 @@ async def retry_failed_log(
 
 
 # 🚨 NEW ROUTE: The Timeline API
+@router.get("/employee/{employee_code}/history")
+async def get_employee_history(
+        employee_code: str,
+        tenant: TenantContext = Depends(get_current_tenant),
+        db: AsyncSession = Depends(get_db)
+):
+    """
+    Full 360° history for an employee — all transactions (Add, Update, Remove)
+    ordered chronologically with nested events for each transaction.
+    """
+    # Filter by employee_code in Python — JSON column uses -> (returns quoted value),
+    # not ->> (plain text), so DB-level string comparison is unreliable without JSONB.
+    stmt = (
+        select(SyncLog)
+        .where(SyncLog.corporate_id == tenant.corporate.id)
+        .order_by(SyncLog.timestamp.asc())
+    )
+    result = await db.execute(stmt)
+    all_logs = result.scalars().all()
+    logs = [log for log in all_logs if log.payload and log.payload.get("employee_code") == employee_code]
+
+    if not logs:
+        raise HTTPException(status_code=404, detail="No history found for this employee.")
+
+    transactions = []
+    for log in logs:
+        events_stmt = (
+            select(SyncLogEvent)
+            .where(SyncLogEvent.sync_log_id == log.id)
+            .order_by(SyncLogEvent.timestamp.asc())
+        )
+        events_result = await db.execute(events_stmt)
+        events = events_result.scalars().all()
+
+        transactions.append({
+            "log_id": log.id,
+            "transaction_id": log.transaction_id,
+            "transaction_type": log.transaction_type,
+            "source": log.source,
+            "status": log.sync_status,
+            "policy_status": log.policy_status,
+            "is_force": log.is_force,
+            "timestamp": log.timestamp,
+            "events": [
+                {
+                    "status": e.event_status,
+                    "actor": e.actor,
+                    "timestamp": e.timestamp,
+                    "details": e.details,
+                    "policy_status": e.policy_status,
+                }
+                for e in events
+            ],
+        })
+
+    return {
+        "employee_code": employee_code,
+        "total_transactions": len(transactions),
+        "transactions": transactions,
+    }
+
+
 @router.get("/{log_id}/history")
 async def get_log_history(
         log_id: int,
@@ -195,7 +259,8 @@ async def get_log_history(
                 "status": event.event_status,
                 "actor": event.actor,
                 "timestamp": event.timestamp,
-                "details": event.details
+                "details": event.details,
+                "policy_status": event.policy_status,
             }
             for event in events
         ]

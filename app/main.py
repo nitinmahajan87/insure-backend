@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.api.v1.endpoints import ingestion, delivery
 from app.api.v1.endpoints import stream
+from app.api.v1.endpoints import portal
 from app.api.v1.endpoints import logs
 from app.api.v1.endpoints import insurer_callbacks
 from app.api.v1.endpoints import broker_admin
@@ -11,8 +12,11 @@ app = FastAPI(title="InsureBackend Enterprise API")
 # URL: POST /api/v1/additions
 app.include_router(ingestion.router, prefix="/api/v1", tags=["Batch Ingestion"])
 
-# 2. Register Stream Router (Real-Time JSON)
+# 2. Register Stream Router (Real-Time HRMS Webhooks — vendor-specific payloads)
 app.include_router(stream.router, prefix="/api/v1/stream", tags=["Real-Time Stream"])
+
+# 3. Register Portal Router (HR Portal UI — canonical schema, no adapter)
+app.include_router(portal.router, prefix="/api/v1/portal", tags=["HR Portal"])
 # Wire up the delivery router
 app.include_router(delivery.router, prefix="/api/v1/delivery", tags=["Outbound Delivery"])
 
