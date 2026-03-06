@@ -29,6 +29,7 @@ from app.models.schemas import (
     AdditionRecord,
     DeletionRecord,
     InsuranceUpdateReport,
+    InsurerResponseRow,
     RejectedRow,
 )
 
@@ -379,6 +380,154 @@ def process_deletions(file_path: str, hrms_provider: str = "standard") -> Insura
         raise
     except Exception as exc:
         raise FileParseError(f"Unexpected processing error: {exc}") from exc
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+
+# ── Insurer response file processor ──────────────────────────────────────────
+# Parses the Excel/CSV the insurer sends back to the broker with policy decisions.
+# Covers the wide variety of column naming conventions used by Indian insurers.
+
+_INSURER_RESPONSE_COLUMN_MAP: dict[str, str] = {
+    # Employee identifier
+    "emp_id":              "employee_code",
+    "member_id":           "employee_code",
+    "employee_id":         "employee_code",
+    "staff_id":            "employee_code",
+    "empno":               "employee_code",
+    "emp_code":            "employee_code",
+
+    # Decision / outcome
+    "outcome":             "status",
+    "decision":            "status",
+    "endorsement_status":  "status",
+    "policy_decision":     "status",
+    "result":              "status",
+    "approval_status":     "status",
+
+    # Policy number
+    "policy_no":           "policy_number",
+    "master_policy":       "policy_number",
+    "gmc_policy_no":       "policy_number",
+    "group_policy_no":     "policy_number",
+
+    # Effective date
+    "coverage_start":      "effective_date",
+    "commencement_date":   "effective_date",
+    "policy_start_date":   "effective_date",
+    "start_date":          "effective_date",
+    "risk_start_date":     "effective_date",
+
+    # Certificate / e-card
+    "cert_no":             "certificate_number",
+    "e_card_no":           "certificate_number",
+    "certificate_no":      "certificate_number",
+    "ecard_no":            "certificate_number",
+    "member_cert_no":      "certificate_number",
+
+    # Insurer's internal reference
+    "endorsement_id":      "insurer_reference_id",
+    "reference_id":        "insurer_reference_id",
+    "ref_id":              "insurer_reference_id",
+    "insurer_ref":         "insurer_reference_id",
+    "transaction_ref":     "insurer_reference_id",
+
+    # Rejection reason
+    "reason":              "rejection_reason",
+    "remarks":             "rejection_reason",
+    "rejection_remark":    "rejection_reason",
+    "remark":              "rejection_reason",
+    "comment":             "rejection_reason",
+    "narration":           "rejection_reason",
+}
+
+
+def process_insurer_response(
+    file_path: str,
+) -> tuple[list[InsurerResponseRow], list[RejectedRow]]:
+    """
+    Parse an insurer response Excel/CSV into validated InsurerResponseRow objects.
+
+    Returns:
+        (valid_rows, parse_errors)
+        valid_rows   — rows the caller should apply to the DB.
+        parse_errors — rows that could not be parsed (missing employee_code / status).
+
+    Raises FileParseError if the file cannot be read at all.
+    Raises MissingColumnsError if mandatory columns are absent after alias resolution.
+    The temp file is always removed (finally block).
+    """
+    try:
+        # 1. Read
+        try:
+            if file_path.endswith(".csv"):
+                df = pl.read_csv(
+                    file_path,
+                    null_values=["NA", "N/A", "null", "NULL", "none", "None", "-", ""],
+                )
+            else:
+                df = pl.read_excel(file_path)
+        except Exception as exc:
+            raise FileParseError(f"Cannot read insurer response file: {exc}") from exc
+
+        # 2. Normalise headers
+        df = df.rename({col: _normalize_header(col) for col in df.columns})
+
+        # 3. Apply column map
+        df = _apply_column_map(df, _INSURER_RESPONSE_COLUMN_MAP)
+
+        # 4. Required-column safety check
+        if "employee_code" not in df.columns:
+            raise MissingColumnsError(
+                "Missing required column 'employee_code'. "
+                "Expected one of: employee_code, emp_id, member_id, empno, …"
+            )
+        if "status" not in df.columns:
+            raise MissingColumnsError(
+                "Missing required column 'status' (insurer decision). "
+                "Expected one of: status, outcome, decision, endorsement_status, result, …"
+            )
+
+        # 5. Parse date column if present
+        df = _parse_date_col(df, "effective_date")
+
+        # 6. Per-row validation
+        valid_rows:   list[InsurerResponseRow] = []
+        parse_errors: list[RejectedRow]        = []
+
+        for idx, row in enumerate(df.to_dicts()):
+            row_errors: list[str] = []
+
+            if not row.get("employee_code"):
+                row_errors.append("employee_code is missing or blank")
+            if not row.get("status"):
+                row_errors.append("status/outcome is missing or blank")
+
+            if row_errors:
+                parse_errors.append(RejectedRow(
+                    row_index=idx + 1,
+                    raw_data={k: str(v) for k, v in row.items()},
+                    errors=row_errors,
+                ))
+                continue
+
+            valid_rows.append(InsurerResponseRow(
+                employee_code        = str(row["employee_code"]).strip(),
+                status               = str(row["status"]).strip().upper(),
+                policy_number        = row.get("policy_number"),
+                effective_date       = row.get("effective_date"),
+                certificate_number   = row.get("certificate_number"),
+                insurer_reference_id = row.get("insurer_reference_id"),
+                rejection_reason     = row.get("rejection_reason"),
+            ))
+
+        return valid_rows, parse_errors
+
+    except (FileParseError, MissingColumnsError):
+        raise
+    except Exception as exc:
+        raise FileParseError(f"Unexpected error processing insurer response: {exc}") from exc
     finally:
         if os.path.exists(file_path):
             os.remove(file_path)

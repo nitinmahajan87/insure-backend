@@ -37,6 +37,10 @@ RECONCILE_AFTER_HOURS: int = 2
 # Max logs processed per sweep run — prevents overwhelming the insurer API.
 RECONCILE_BATCH_SIZE: int = 200
 
+# COMPLETED_OFFLINE records older than this with no callback are flagged for ops.
+# Insurers typically turn around offline files within 1–3 days; 7 days = safe cutoff.
+OFFLINE_STALE_DAYS: int = 7
+
 _APPROVED_STATUSES = {"APPROVED", "ACCEPTED", "ISSUED"}
 
 
@@ -92,6 +96,7 @@ def _apply_poll_result(
     record_audit_event_sync(
         db, log.id, new_sync_status, "RECONCILIATION_POLLER",
         {"polled_result": poll_result},
+        policy_status=new_policy_status.value,
     )
     logger.info(f"Log {log.id}: reconciled via polling → {new_sync_status}")
 
@@ -146,31 +151,84 @@ def _reconcile_single_log(db, log: SyncLog) -> None:
 @celery_app.task(name="app.tasks.reconciliation_tasks.reconcile_pending_syncs")
 def reconcile_pending_syncs() -> str:
     """
-    Hourly sweep.  Finds ACTIVE logs older than RECONCILE_AFTER_HOURS that
-    have not yet received an insurer callback and tries to resolve them.
+    Hourly sweep — two passes:
+
+    Pass 1 (ACTIVE, no callback, >2 h old):
+      Webhook-delivered records where the insurer acknowledged receipt but never
+      sent the async callback with the final decision.  Polls the insurer's status
+      API if supported, otherwise flags for manual review.
+
+    Pass 2 (COMPLETED_OFFLINE, no callback, >7 days old):
+      Records dispatched via the offline file channel.  After 7 days the broker
+      should have received and uploaded the insurer's response file; if
+      callback_received_at is still None, something was missed.  Writes a
+      RECONCILIATION_PENDING audit event so the ops team can follow up.
     """
     db = SessionLocal()
     try:
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=RECONCILE_AFTER_HOURS)
+        now = datetime.now(timezone.utc)
 
-        pending_logs = (
+        # ── Pass 1: ACTIVE (webhook) — poll or flag ────────────────────────
+        webhook_cutoff = now - timedelta(hours=RECONCILE_AFTER_HOURS)
+
+        active_logs = (
             db.query(SyncLog)
             .filter(
                 SyncLog.sync_status == SyncStatus.ACTIVE,
                 SyncLog.callback_received_at == None,  # noqa: E711
-                SyncLog.timestamp < cutoff,
+                SyncLog.timestamp < webhook_cutoff,
             )
             .limit(RECONCILE_BATCH_SIZE)
             .all()
         )
 
-        logger.info(f"Reconciliation sweep: {len(pending_logs)} logs to process.")
-
-        for log in pending_logs:
+        logger.info(f"Reconciliation sweep pass 1 (ACTIVE): {len(active_logs)} logs.")
+        for log in active_logs:
             _reconcile_single_log(db, log)
 
+        # ── Pass 2: COMPLETED_OFFLINE — stale offline dispatch flag ───────
+        offline_cutoff = now - timedelta(days=OFFLINE_STALE_DAYS)
+
+        stale_offline_logs = (
+            db.query(SyncLog)
+            .filter(
+                SyncLog.sync_status.in_([
+                    SyncStatus.BROKER_REVIEW_PENDING,
+                    SyncStatus.COMPLETED_OFFLINE,   # Legacy records
+                ]),
+                SyncLog.callback_received_at == None,  # noqa: E711
+                SyncLog.timestamp < offline_cutoff,
+            )
+            .limit(RECONCILE_BATCH_SIZE)
+            .all()
+        )
+
+        logger.info(
+            f"Reconciliation sweep pass 2 (COMPLETED_OFFLINE stale): "
+            f"{len(stale_offline_logs)} logs."
+        )
+        for log in stale_offline_logs:
+            try:
+                record_audit_event_sync(
+                    db, log.id, SyncStatus.COMPLETED_OFFLINE,
+                    "RECONCILIATION_SWEEPER",
+                    {
+                        "note": (
+                            f"Offline response overdue — dispatched "
+                            f"{(now - log.timestamp.replace(tzinfo=timezone.utc)).days} days ago "
+                            "with no insurer confirmation received. "
+                            "Broker should upload the insurer response file or follow up manually."
+                        )
+                    },
+                )
+            except Exception as exc:
+                logger.error(f"Log {log.id}: stale-offline flag failed — {exc}")
+
         db.commit()
-        return f"Sweep complete: {len(pending_logs)} logs processed."
+        return (
+            f"Sweep complete: {len(active_logs)} active logs, "
+            f"{len(stale_offline_logs)} stale offline logs processed."
+        )
 
     except Exception as exc:
         db.rollback()

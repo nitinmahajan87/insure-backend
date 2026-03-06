@@ -114,3 +114,28 @@ class IngestionResponse(BaseModel):
     message:         str
     report:          InsuranceUpdateReport
     file_download_url: str
+
+
+# ── Insurer Response File ─────────────────────────────────────────────────────
+# Schemas for processing the response Excel/CSV sent back by the insurer to the broker.
+
+class InsurerResponseRow(BaseModel):
+    """One row parsed from the insurer's response file."""
+    employee_code:        str
+    status:               str               # normalised to uppercase: ISSUED, REJECTED, PENDING …
+    policy_number:        Optional[str] = None
+    effective_date:       Optional[date] = None
+    certificate_number:   Optional[str] = None
+    insurer_reference_id: Optional[str] = None
+    rejection_reason:     Optional[str] = None
+
+
+class InsurerResponseReport(BaseModel):
+    """Summary returned to the broker after processing the insurer response file."""
+    total_rows:          int
+    issued_count:        int
+    soft_rejected_count: int
+    unmatched_count:     int    # employee_code not found / no open SyncLog
+    parse_error_count:   int    # rows we could not parse at all
+    message:             str
+    parse_errors:        List[RejectedRow]  # row-level parse failures for broker to review

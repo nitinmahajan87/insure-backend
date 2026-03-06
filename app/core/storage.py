@@ -30,15 +30,23 @@ class S3Backend:
         self.bucket = os.environ["STORAGE_BUCKET"]
         self._presign_ttl = int(os.getenv("STORAGE_PRESIGN_TTL", "900"))
 
-        self._client = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
+        creds = dict(
             aws_access_key_id=os.environ["STORAGE_ACCESS_KEY"],
             aws_secret_access_key=os.environ["STORAGE_SECRET_KEY"],
             region_name=os.getenv("STORAGE_REGION", "ap-south-1"),
-            # s3v4 signatures required by MinIO, R2, and AWS
             config=Config(signature_version="s3v4"),
         )
+
+        # Primary client — uses internal endpoint for upload/download operations.
+        self._client = boto3.client("s3", endpoint_url=endpoint, **creds)
+
+        # Presign client — uses the *public* endpoint so that the generated URL's
+        # host matches the host the browser will actually connect to.
+        # S3v4 signatures include the Host header; rewriting the URL post-signing
+        # breaks the HMAC, so we must sign with the correct host from the start.
+        presign_base = os.getenv("STORAGE_PRESIGN_BASE_URL", "").strip()
+        presign_endpoint = presign_base if presign_base else endpoint
+        self._presign_client = boto3.client("s3", endpoint_url=presign_endpoint, **creds)
 
     # ------------------------------------------------------------------
     # Core operations
@@ -55,9 +63,13 @@ class S3Backend:
         return key
 
     def presigned_url(self, key: str, expires_in: int | None = None) -> str:
-        """Generate a pre-signed GET URL. Default TTL from env (STORAGE_PRESIGN_TTL)."""
+        """Generate a pre-signed GET URL signed with the public endpoint.
+
+        Uses _presign_client (initialized with STORAGE_PRESIGN_BASE_URL) so the
+        HMAC signature matches the host the browser will connect to.
+        """
         ttl = expires_in if expires_in is not None else self._presign_ttl
-        return self._client.generate_presigned_url(
+        return self._presign_client.generate_presigned_url(
             "get_object",
             Params={"Bucket": self.bucket, "Key": key},
             ExpiresIn=ttl,

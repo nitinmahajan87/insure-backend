@@ -30,6 +30,7 @@ async def get_transactions(
             SyncStatus.SOFT_REJECTED,
             SyncStatus.PENDING_BOTH,
             SyncStatus.PENDING_OFFLINE,
+            SyncStatus.BROKER_REVIEW_PENDING,
         ])
     )
 

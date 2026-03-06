@@ -99,8 +99,6 @@ async def upload_additions(
                 event_type="BATCH_ADDITION",
                 source=SyncSource.BATCH,
             )
-            if s3_key:
-                log_entry.file_path = s3_key
             log_ids.append(log_entry.id)
 
         await db.commit()
@@ -199,8 +197,6 @@ async def upload_deletions(
                 event_type="BATCH_DELETION",
                 source=SyncSource.BATCH,
             )
-            if s3_key:
-                log_entry.file_path = s3_key
             log_ids.append(log_entry.id)
 
         await db.commit()

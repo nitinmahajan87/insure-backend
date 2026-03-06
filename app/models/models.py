@@ -28,13 +28,14 @@ class DeliveryChannel(enum.Enum):
 class SyncStatus(str, enum.Enum):
     PENDING = "PENDING"
     PROVISIONING = "PROVISIONING"
-    ACTIVE = "ACTIVE"  # Delivered to insurer
+    ACTIVE = "ACTIVE"              # Delivered via webhook, insurer acknowledged
     FAILED = "FAILED"
-    SOFT_REJECTED = "SOFT_REJECTED"  # NEW: Insurer accepted receipt but rejected data later
-    COMPLETED_OFFLINE = "COMPLETED_OFFLINE"
-    PENDING_OFFLINE = "PENDING_OFFLINE"
+    SOFT_REJECTED = "SOFT_REJECTED"        # Insurer rejected the record
+    COMPLETED_OFFLINE = "COMPLETED_OFFLINE"  # Legacy / Celery-validated, awaiting broker dispatch
+    PENDING_OFFLINE = "PENDING_OFFLINE"      # In queue, not yet dispatched
     COMPLETED_BOTH = "COMPLETED_BOTH"
     PENDING_BOTH = "PENDING_BOTH"
+    BROKER_REVIEW_PENDING = "BROKER_REVIEW_PENDING"  # Report generated; broker to send to insurer
 
 
 class ApiKeyScope(str, enum.Enum):  # NEW ENUM
@@ -43,10 +44,11 @@ class ApiKeyScope(str, enum.Enum):  # NEW ENUM
 
 
 class PolicyStatus(str, enum.Enum):  # NEW ENUM
-    PENDING_ISSUANCE = "PENDING_ISSUANCE"  # Sent, awaiting confirmation
-    ISSUED = "ISSUED"  # Insurer confirmed coverage
-    SOFT_REJECTED = "SOFT_REJECTED"  # Business rule failure (age limit, etc.)
-    LAPSED = "LAPSED"  # Coverage ended
+    PENDING_DISPATCH = "PENDING_DISPATCH"  # In queue, report not yet generated
+    PENDING_ISSUANCE = "PENDING_ISSUANCE"  # Report dispatched, awaiting insurer confirmation
+    ISSUED = "ISSUED"                      # Insurer confirmed coverage
+    SOFT_REJECTED = "SOFT_REJECTED"        # Business rule failure (age limit, etc.)
+    LAPSED = "LAPSED"                      # Coverage ended (deletion confirmed)
     CANCELLED = "CANCELLED"
 
 #Differentiate API vs File Uploads

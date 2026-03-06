@@ -49,7 +49,7 @@ async def get_broker_profile(
         .join(Corporate, SyncLog.corporate_id == Corporate.id)
         .where(
             Corporate.broker_id == broker.id,
-            SyncLog.sync_status == SyncStatus.PENDING,
+            SyncLog.sync_status.in_([SyncStatus.PENDING_OFFLINE, SyncStatus.PENDING_BOTH, SyncStatus.BROKER_REVIEW_PENDING]),
         )
     )).scalar() or 0
 
@@ -101,12 +101,12 @@ async def list_broker_corporates(
     )).all()
     emp_counts = {row.corporate_id: row.count for row in emp_rows}
 
-    # Pending-sync counts per corporate — single query
+    # Pending-sync counts per corporate — offline queue only (actionable by broker)
     pending_rows = (await db.execute(
         select(SyncLog.corporate_id, func.count(SyncLog.id).label("count"))
         .where(
             SyncLog.corporate_id.in_(corporate_ids),
-            SyncLog.sync_status == SyncStatus.PENDING,
+            SyncLog.sync_status.in_([SyncStatus.PENDING_OFFLINE, SyncStatus.PENDING_BOTH, SyncStatus.BROKER_REVIEW_PENDING]),
         )
         .group_by(SyncLog.corporate_id)
     )).all()
