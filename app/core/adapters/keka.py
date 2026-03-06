@@ -1,28 +1,81 @@
 """
 Keka HR Adapter
 ===============
-Handles two directions:
+Handles three directions:
 
 1. INBOUND (Webhook):  Keka pushes employee events to our /api/v1/stream/* endpoints.
    Keka webhook payload uses camelCase fields: employeeNumber, firstName, etc.
 
-2. OUTBOUND (Polling): We GET employees from Keka HRIS API when webhook config
+2. INBOUND (Batch file): HR admin uploads a Keka CSV/Excel export.
+   Column names are normalised by Polars then translated via ADDITION_COLUMN_MAP /
+   DELETION_COLUMN_MAP before Pydantic validation.
+
+3. OUTBOUND (Polling): We GET employees from Keka HRIS API when webhook config
    isn't available. Uses OAuth 2.0 Bearer token.
    GET https://{company}.{env}.com/api/v1/hris/employees
 
 Keka developer docs: https://developers.keka.com/reference/get_hris-employees
 """
-from typing import Dict, Any, List, Optional
+from typing import ClassVar, Dict, Any, List, Optional
 from datetime import datetime
 import requests
 
-from app.core.adapters.base import BaseHRMSAdapter, NormalizedEmployee
+from app.core.adapters.base import BaseHRMSAdapter, NormalizedEmployee, _SPLIT_NAME_SENTINEL
 
 # Keka gender enum mapping: Keka returns int 0-3
 _KEKA_GENDER_MAP = {0: "Unknown", 1: "Male", 2: "Female", 3: "Other"}
 
 
 class KekaAdapter(BaseHRMSAdapter):
+
+    # ── Batch file column maps ─────────────────────────────────────────────────
+    # Keys = column name after Polars normalisation (lowercase + underscore).
+    # Keka CSV/Excel exports use a mix of snake_case and compact forms.
+    ADDITION_COLUMN_MAP: ClassVar[Dict[str, str]] = {
+        # Employee identifier
+        "emp_id":           "employee_code",
+        "employee_id":      "employee_code",
+        "employee_number":  "employee_code",
+        "empno":            "employee_code",
+        # Name (Keka may export a combined "Employee Name" column)
+        "employee_name":    _SPLIT_NAME_SENTINEL,
+        "name":             _SPLIT_NAME_SENTINEL,
+        "firstname":        "first_name",
+        "lastname":         "last_name",
+        # Dates — Keka exports use their UI label names
+        "dob":              "date_of_birth",
+        "birth_date":       "date_of_birth",
+        "doj":              "date_of_joining",
+        "joining_date":     "date_of_joining",
+        "date_joined":      "date_of_joining",
+        # pre-Phase-3 normalization forms (Polars lowercases camelCase as one token)
+        "dateofbirth":      "date_of_birth",
+        "dateofjoining":    "date_of_joining",
+        # Sum insured — Keka doesn't natively track SI; may appear in custom fields
+        "sum_assured":      "sum_insured",
+        "cover_amount":     "sum_insured",
+        "insured_amount":   "sum_insured",
+        # Email / gender — already canonical in Keka exports; listed for completeness
+        "work_email":       "email",
+        "official_email":   "email",
+    }
+
+    DELETION_COLUMN_MAP: ClassVar[Dict[str, str]] = {
+        # Employee identifier
+        "emp_id":              "employee_code",
+        "employee_id":         "employee_code",
+        "employee_number":     "employee_code",
+        "empno":               "employee_code",
+        # Leaving date — Keka uses several label names across versions
+        "exit_date":           "date_of_leaving",
+        "last_working_date":   "date_of_leaving",
+        "last_working_day":    "date_of_leaving",
+        "relieving_date":      "date_of_leaving",
+        "separation_date":     "date_of_leaving",
+        # pre-Phase-3 compact forms
+        "lastworkingdate":     "date_of_leaving",
+        "exitdate":            "date_of_leaving",
+    }
 
     # ── Inbound: Keka webhook → canonical dict ────────────────────────────────
     # Keka webhook payload uses camelCase.

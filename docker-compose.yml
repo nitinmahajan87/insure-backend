@@ -73,6 +73,43 @@ services:
     networks:
       - insurtech_net
 
+  # Object Storage — S3-compatible local store (mirrors AWS S3 ap-south-1 in production)
+  minio:
+    image: minio/minio:latest
+    container_name: insurtech_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # MinIO Console UI (http://localhost:9001)
+    volumes:
+      - minio_data:/data
+    networks:
+      - insurtech_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # One-shot: creates the bucket on first run then exits
+  minio_init:
+    image: minio/mc:latest
+    container_name: insurtech_minio_init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123 &&
+        mc mb --ignore-existing local/insurtech-reports &&
+        echo 'Bucket ready.'
+      "
+    networks:
+      - insurtech_net
+
   pgadmin:
     image: dpage/pgadmin4
     container_name: insurtech_pgadmin
@@ -92,3 +129,4 @@ networks:
 
 volumes:
   postgres_data:
+  minio_data:

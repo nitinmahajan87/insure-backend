@@ -1,16 +1,18 @@
 # app/api/v1/endpoints/delivery.py
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, case
+import asyncio
 import os
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import case, desc, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
 from app.core.database import get_db
 from app.core.security import get_current_tenant, TenantContext
+from app.core.storage import get_storage
 from app.models.models import SyncLog, Employee, SyncStatus, SyncLogEvent
 from app.services.outbound_service import OutboundTransformer
-from sqlalchemy import func, desc
-from typing import Optional
 
 router = APIRouter()
 BASE_PATH = os.getenv("BASE_OUTBOUND_PATH", "/app/outbound_files")
@@ -43,19 +45,20 @@ async def generate_offline_report(
             if emp_code:
                 employee_codes.append(emp_code)
 
-        # 3. Generate File using the universal Transformer
+        # 3. Generate File using the universal Transformer (upload to object storage)
         full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
         format_type = getattr(tenant.corporate, 'insurer_format', 'excel')
 
-        file_path, filename = OutboundTransformer.to_file(
-            data=data,
-            filename_prefix="offline_sweep",
-            output_dir=full_directory,
-            format_type=format_type
+        s3_key, filename = await asyncio.to_thread(
+            OutboundTransformer.to_file,
+            data,
+            "offline_sweep",
+            full_directory,
+            format_type,
         )
 
-        # Generate the dynamic download link
-        download_url = str(request.url_for("download_outbound_file", file_name=filename))
+        # Pre-signed URL for direct download from storage
+        download_url = await asyncio.to_thread(get_storage().presigned_url, s3_key)
 
         # 4. Update SyncLog statuses
         for log in pending_logs:
@@ -67,7 +70,7 @@ async def generate_offline_report(
                 log.sync_status = SyncStatus.COMPLETED_OFFLINE
                 new_status = SyncStatus.COMPLETED_OFFLINE
 
-            log.file_path = f"{tenant.corporate.base_folder}/{filename}"
+            log.file_path = s3_key
 
             # Log the Sweeper action
             audit_event = SyncLogEvent(
@@ -98,7 +101,8 @@ async def generate_offline_report(
 
         return {
             "message": f"Successfully swept {len(data)} pending records into a {format_type.upper()} file.",
-            "download_url": download_url
+            "download_url": download_url,
+            "record_count": len(data),
         }
     except Exception as e:
         await db.rollback()
@@ -128,25 +132,26 @@ async def preview_offline_report(
 
         data = [log.payload for log in pending_logs]
 
-        # 3. Generate File
+        # 3. Generate File (preview_ prefix — HR knows this isn't the final dispatch)
         full_directory = os.path.join(BASE_PATH, tenant.corporate.base_folder)
         format_type = getattr(tenant.corporate, 'insurer_format', 'excel')
 
-        # Notice the 'preview_' prefix so HR knows this isn't the final dispatch
-        file_path, filename = OutboundTransformer.to_file(
-            data=data,
-            filename_prefix="preview_sweep",
-            output_dir=full_directory,
-            format_type=format_type
+        s3_key, filename = await asyncio.to_thread(
+            OutboundTransformer.to_file,
+            data,
+            "preview_sweep",
+            full_directory,
+            format_type,
         )
 
-        download_url = str(request.url_for("download_outbound_file", file_name=filename))
+        download_url = await asyncio.to_thread(get_storage().presigned_url, s3_key)
 
         # 🚨 Notice: NO Database updates or commits here! The queue remains untouched.
 
         return {
             "message": f"Preview generated for {len(data)} pending records.",
-            "download_url": download_url
+            "download_url": download_url,
+            "record_count": len(data),
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate preview report: {str(e)}")
@@ -180,16 +185,24 @@ async def get_delivery_history(
         result = await db.execute(stmt)
         rows = result.all()
 
+        storage = get_storage()
         history = []
         for row in rows:
-            # Extract just the filename from "folder/filename.xlsx"
-            file_name_only = row.file_path.split('/')[-1] if '/' in row.file_path else row.file_path
+            # file_path is the S3 key (e.g. "outbound/wipro/addition_report_...xlsx")
+            # Extract the filename as the last segment for display.
+            file_name_only = row.file_path.split('/')[-1] if row.file_path else ""
+            s3_key = row.file_path  # already the full S3 key
+
+            try:
+                download_url = await asyncio.to_thread(storage.presigned_url, s3_key)
+            except Exception:
+                download_url = None  # file may have been deleted from storage
 
             history.append({
                 "file_name": file_name_only,
                 "generated_at": row.generated_at,
                 "record_count": row.record_count,
-                "download_url": str(request.url_for("download_outbound_file", file_name=file_name_only))
+                "download_url": download_url,
             })
 
         return {"data": history}

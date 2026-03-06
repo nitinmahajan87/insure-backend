@@ -1,28 +1,80 @@
 """
 Zoho People Adapter
 ===================
-Handles two directions:
+Handles three directions:
 
 1. INBOUND (Webhook):  Zoho pushes employee events to our /api/v1/stream/* endpoints.
    Zoho webhook payload uses PascalCase fields: EmployeeID, FirstName, LastName, etc.
 
-2. OUTBOUND (Polling): We GET employees from Zoho People API when webhook config
+2. INBOUND (Batch file): HR admin uploads a Zoho People CSV/Excel export.
+   Column names are normalised by Polars then translated via ADDITION_COLUMN_MAP /
+   DELETION_COLUMN_MAP before Pydantic validation.
+
+3. OUTBOUND (Polling): We GET employees from Zoho People API when webhook config
    isn't available. Uses OAuth 2.0.
    GET https://people.zoho.com/api/forms/employee/getRecords
 
 Zoho People API docs: https://www.zoho.com/people/api/bulk-records.html
 """
-from typing import Dict, Any, List, Optional
+from typing import ClassVar, Dict, Any, List, Optional
 from datetime import datetime
 import requests
 
-from app.core.adapters.base import BaseHRMSAdapter, NormalizedEmployee
+from app.core.adapters.base import BaseHRMSAdapter, NormalizedEmployee, _SPLIT_NAME_SENTINEL
 
 # Zoho People bulk-records API endpoint
 _ZOHO_EMPLOYEE_URL = "https://people.zoho.com/api/forms/employee/getRecords"
 
 
 class ZohoAdapter(BaseHRMSAdapter):
+
+    # ── Batch file column maps ─────────────────────────────────────────────────
+    # Zoho People CSV exports use their internal field label names, which are
+    # PascalCase / compact.  After Polars normalisation they become lowercase.
+    ADDITION_COLUMN_MAP: ClassVar[Dict[str, str]] = {
+        # Employee identifier — Zoho uses EmployeeID or EmpID
+        "employeeid":       "employee_code",
+        "employee_id":      "employee_code",
+        "empid":            "employee_code",
+        "emp_id":           "employee_code",
+        # Name — Zoho exports FirstName / LastName or combined Employee Name
+        "firstname":        "first_name",
+        "first_name":       "first_name",      # already canonical; explicit for clarity
+        "lastname":         "last_name",
+        "last_name":        "last_name",
+        "employee_name":    _SPLIT_NAME_SENTINEL,
+        "name":             _SPLIT_NAME_SENTINEL,
+        # Email
+        "emailid":          "email",
+        "email_id":         "email",
+        # Dates — Zoho exports use compact label names
+        "dateofbirth":      "date_of_birth",
+        "dob":              "date_of_birth",
+        "date_of_birth":    "date_of_birth",   # canonical; explicit
+        "dateofjoining":    "date_of_joining",
+        "doj":              "date_of_joining",
+        "date_of_joining":  "date_of_joining", # canonical; explicit
+        "joining_date":     "date_of_joining",
+        # Sum insured — not a native Zoho field; may exist as a custom column
+        "sum_assured":      "sum_insured",
+        "cover_amount":     "sum_insured",
+        "insured_amount":   "sum_insured",
+    }
+
+    DELETION_COLUMN_MAP: ClassVar[Dict[str, str]] = {
+        # Employee identifier
+        "employeeid":       "employee_code",
+        "employee_id":      "employee_code",
+        "empid":            "employee_code",
+        "emp_id":           "employee_code",
+        # Leaving date — Zoho uses several label names
+        "exitdate":         "date_of_leaving",
+        "exit_date":        "date_of_leaving",
+        "dateofexit":       "date_of_leaving",
+        "date_of_exit":     "date_of_leaving",
+        "last_working_day": "date_of_leaving",
+        "relieving_date":   "date_of_leaving",
+    }
 
     # ── Inbound: Zoho webhook → canonical dict ────────────────────────────────
     # Zoho webhook payload uses PascalCase + their own field label names.

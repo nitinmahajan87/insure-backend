@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import ClassVar, Dict, Any, Optional
 
 import requests
 import xmltodict
@@ -10,6 +10,29 @@ logger = logging.getLogger(__name__)
 
 
 class IciciLombardAdapter(BaseInsurerAdapter):
+
+    # ── Outbound batch file column maps ───────────────────────────────────────
+    # Maps our canonical field names → ICICI Lombard's expected batch file headers.
+    ADDITION_FILE_COLUMNS: ClassVar[Dict[str, str]] = {
+        "employee_code":    "MEMBER_CODE",
+        "first_name":       "FIRST_NAME",
+        "last_name":        "LAST_NAME",
+        "date_of_birth":    "DATE_OF_BIRTH",
+        "gender":           "GENDER",
+        "relationship":     "RELATION",
+        "sum_insured":      "SUM_INSURED",
+        "date_of_joining":  "JOINING_DATE",
+        "email":            "EMAIL_ID",
+    }
+
+    DELETION_FILE_COLUMNS: ClassVar[Dict[str, str]] = {
+        "employee_code":    "MEMBER_CODE",
+        "member_id":        "INSURER_MEMBER_ID",
+        "date_of_leaving":  "EXIT_DATE",
+    }
+
+    # ── Webhook / API transform methods ───────────────────────────────────────
+
     def transform_addition(self, standard_payload: Dict[str, Any]) -> str:
         """Transforms standard payload into ICICI Lombard XML for Additions."""
 

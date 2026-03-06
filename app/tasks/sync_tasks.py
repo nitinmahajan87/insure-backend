@@ -4,6 +4,9 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 from celery import group as celery_group
+from celery.exceptions import Retry
+from requests.exceptions import RequestException
+from sqlalchemy.exc import OperationalError as DBOperationalError
 
 from app.core.celery_app import celery_app
 from app.core.database import SessionLocal
@@ -210,10 +213,13 @@ def _process_single_log(db, log: SyncLog) -> None:
 # and commits the whole chunk in one transaction.
 # ---------------------------------------------------------------------------
 
+_RETRIABLE = (RequestException, ConnectionError, TimeoutError, DBOperationalError)
+
+
 @celery_app.task(
     bind=True,
     max_retries=3,
-    autoretry_for=(Exception,),
+    autoretry_for=_RETRIABLE,
     retry_backoff=True,
     retry_jitter=True,
 )
@@ -245,7 +251,7 @@ def process_batch_chunk(self, log_ids: List[int]):
 @celery_app.task(
     bind=True,
     max_retries=5,
-    autoretry_for=(Exception,),
+    autoretry_for=_RETRIABLE,
     retry_backoff=True,
     retry_jitter=True,
 )
@@ -287,7 +293,6 @@ def process_sync_event(self, log_id: int):
 
         is_deletion = log.transaction_type in ("DELETION", "BATCH_DELETION")
         is_addition = not is_deletion  # ADDITION, UPDATE, BATCH_ADDITION all use transform_addition
-        is_batch = log.transaction_type in ("BATCH_ADDITION", "BATCH_DELETION")
 
         new_policy_status = PolicyStatus.LAPSED if is_deletion else PolicyStatus.PENDING_ISSUANCE
         ps_value = new_policy_status.value
@@ -348,45 +353,42 @@ def process_sync_event(self, log_id: int):
                 raise self.retry(exc=exc)
 
         elif corporate.delivery_channel == DeliveryChannel.OFFLINE:
+            # Real-time OFFLINE: park for the delivery sweeper.
+            # (Batch OFFLINE records never reach this task — they use process_batch_chunk.)
             offline_ps = PolicyStatus.LAPSED.value if is_deletion else None
-            if is_batch:
-                log.sync_status = SyncStatus.COMPLETED_OFFLINE
-                if offline_ps:
-                    log.policy_status = offline_ps
-                if employee:
-                    employee.delivery_status = SyncStatus.COMPLETED_OFFLINE
-                    if is_deletion:
-                        employee.policy_status = PolicyStatus.LAPSED
-                record_audit_event_sync(
-                    db, log.id, SyncStatus.COMPLETED_OFFLINE, "CELERY_WORKER",
-                    {"note": "Batch processed immediately"}, policy_status=offline_ps,
-                )
-            else:
-                log.sync_status = SyncStatus.PENDING_OFFLINE
-                if offline_ps:
-                    log.policy_status = offline_ps
-                if employee:
-                    employee.delivery_status = SyncStatus.PENDING_OFFLINE
-                    if is_deletion:
-                        employee.policy_status = PolicyStatus.LAPSED
-                record_audit_event_sync(
-                    db, log.id, SyncStatus.PENDING_OFFLINE, "CELERY_WORKER",
-                    {"note": "Parked for sweeper"}, policy_status=offline_ps,
-                )
+            log.sync_status = SyncStatus.PENDING_OFFLINE
+            if offline_ps:
+                log.policy_status = offline_ps
+            if employee:
+                employee.delivery_status = SyncStatus.PENDING_OFFLINE
+                if is_deletion:
+                    employee.policy_status = PolicyStatus.LAPSED
+            record_audit_event_sync(
+                db, log.id, SyncStatus.PENDING_OFFLINE, "CELERY_WORKER",
+                {"note": "Parked for sweeper"}, policy_status=offline_ps,
+            )
 
         db.commit()
         return f"Processed log {log_id} successfully"
 
+    except Retry:
+        # Celery retry signal — let it propagate cleanly without marking FAILED.
+        db.rollback()
+        raise
     except Exception as exc:
         db.rollback()
+        logger.error(f"Task crashed for log {log_id}: {exc}")
         if log:
-            log.sync_status = SyncStatus.FAILED
-            log.error_message = str(exc)
-            db.commit()
-        logger.error(f"Task failed for log {log_id}: {exc}")
-        record_audit_event_sync(
-            db, log.id, SyncStatus.FAILED, "CELERY_WORKER_CRASH", {"error": str(exc)}
-        )
-        raise exc
+            try:
+                log.sync_status = SyncStatus.FAILED
+                log.error_message = str(exc)
+                record_audit_event_sync(
+                    db, log.id, SyncStatus.FAILED, "CELERY_WORKER_CRASH", {"error": str(exc)}
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                logger.error(f"Failed to persist FAILED state for log {log_id}")
+        raise
     finally:
         db.close()

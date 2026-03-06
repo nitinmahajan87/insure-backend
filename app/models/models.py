@@ -1,7 +1,7 @@
 import uuid
 import enum
 from datetime import datetime
-from sqlalchemy import Column, String, Boolean, ForeignKey, DateTime, Date, Float, Enum, JSON, Integer, func
+from sqlalchemy import Column, String, Boolean, ForeignKey, DateTime, Date, Float, Numeric, Enum, JSON, Integer, func
 from sqlalchemy.orm import relationship, DeclarativeBase
 
 
@@ -120,7 +120,7 @@ class Employee(Base, AuditMixin):
     gender = Column(String, nullable=True)
     date_of_birth = Column(Date, nullable=True)
     date_of_joining = Column(Date, nullable=True)
-    sum_insured = Column(Float)
+    sum_insured = Column(Numeric(15, 2))
     policy_number = Column(String, nullable=True)
     status = Column(String, default="active")
     date_of_leaving = Column(Date, nullable=True)

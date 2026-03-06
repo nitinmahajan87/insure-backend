@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import ClassVar, Dict, Any, Optional
 
 import requests
 
@@ -9,6 +9,30 @@ logger = logging.getLogger(__name__)
 
 
 class HdfcErgoAdapter(BaseInsurerAdapter):
+
+    # ── Outbound batch file column maps ───────────────────────────────────────
+    # Maps our canonical field names → HDFC Ergo's expected batch file headers.
+    # Column order is significant: HDFC Ergo expects a fixed template layout.
+    ADDITION_FILE_COLUMNS: ClassVar[Dict[str, str]] = {
+        "employee_code":    "EMP_CODE",
+        "first_name":       "FIRST_NAME",
+        "last_name":        "LAST_NAME",
+        "date_of_birth":    "DATE_OF_BIRTH",
+        "gender":           "GENDER",
+        "relationship":     "RELATIONSHIP",
+        "sum_insured":      "SUM_INSURED",
+        "date_of_joining":  "COVERAGE_START_DATE",
+        "email":            "EMAIL",
+    }
+
+    DELETION_FILE_COLUMNS: ClassVar[Dict[str, str]] = {
+        "employee_code":    "EMP_CODE",
+        "member_id":        "MEMBER_ID",
+        "date_of_leaving":  "CANCELLATION_DATE",
+    }
+
+    # ── Webhook / API transform methods ───────────────────────────────────────
+
     def transform_addition(self, standard_payload: Dict[str, Any]) -> Dict[str, Any]:
         """Transforms standard payload into HDFC Ergo JSON format for Additions."""
 
