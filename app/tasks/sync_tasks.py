@@ -1,11 +1,14 @@
 import json
 import logging
+import os
+from datetime import date as _date
 from types import SimpleNamespace
 from typing import List, Optional
 
 from celery import group as celery_group
 from celery.exceptions import Retry
 from requests.exceptions import RequestException
+from sqlalchemy import insert as sa_insert
 from sqlalchemy.exc import OperationalError as DBOperationalError
 
 from app.core.celery_app import celery_app
@@ -14,13 +17,15 @@ from app.core.cache import cache_get, cache_set, CORPORATE_TTL
 from app.core.outbound.factory import get_insurer_adapter
 from app.models.models import (
     SyncLog, Corporate, Employee,
-    SyncStatus, PolicyStatus, DeliveryChannel, SyncLogEvent,
+    SyncStatus, PolicyStatus, DeliveryChannel, SyncLogEvent, SyncSource,
 )
+from app.services.outbound_service import OutboundTransformer
 from app.services.insurer_connector import InsurerConnector, INSURER_API_KEY
 
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 100  # records per Celery worker; tune to worker memory / insurer rate limits
+BASE_PATH = os.getenv("BASE_OUTBOUND_PATH", "/app/outbound_files")
 
 # Terminal statuses: logs in these states must not be reprocessed.
 _TERMINAL_STATUSES = {
@@ -99,7 +104,7 @@ def record_audit_event_sync(
 # exceptions are caught per-record so one bad row never rolls back the chunk.
 # ---------------------------------------------------------------------------
 
-def _process_single_log(db, log: SyncLog) -> None:
+def _process_single_log(db, log: SyncLog, employee: Optional[Employee] = None) -> None:
     # -- Idempotency guard --------------------------------------------------
     # A chunk retry must not re-send records that already reached a terminal
     # state in a previous attempt.
@@ -112,15 +117,8 @@ def _process_single_log(db, log: SyncLog) -> None:
         logger.warning(f"Log {log.id}: corporate {log.corporate_id} not found. Skipping.")
         return
 
-    # Fetch the employee BEFORE marking PROVISIONING so we can snapshot
-    # the existing policy_status for the audit trail.
-    emp_code = log.payload.get("employee_code")
-    employee = None
-    if emp_code:
-        employee = db.query(Employee).filter(
-            Employee.corporate_id == log.corporate_id,
-            Employee.employee_code == emp_code,
-        ).first()
+    # employee is pre-fetched by process_batch_chunk (bulk IN query).
+    # For the real-time path (process_sync_event), it is fetched below as before.
 
     pre_ps = None
     if employee and employee.policy_status:
@@ -229,19 +227,50 @@ _RETRIABLE = (RequestException, ConnectionError, TimeoutError, DBOperationalErro
 def process_batch_chunk(self, log_ids: List[int]):
     """
     Fan-out worker.  Receives a chunk of log IDs dispatched by a Celery Group
-    from the ingestion endpoint.  One DB session per chunk; one commit at the end.
+    from the ingestion endpoint.
+
+    Two key hardening changes vs the naive implementation:
+    1. Bulk employee pre-fetch — one IN query for the whole chunk instead of
+       100 individual SELECTs (eliminates the N+1 query problem).
+    2. Per-record commit with per-record isolation — each log is committed
+       before the next HTTP call fires, so a DB failure on record N cannot
+       cause records 1..N-1 to be reprocessed on retry (phantom HTTP calls).
     """
     db = SessionLocal()
     try:
         logs = db.query(SyncLog).filter(SyncLog.id.in_(log_ids)).all()
+
+        # ── Bulk pre-fetch employees (1 IN query instead of N SELECTs) ────────
+        emp_keys = [
+            (log.corporate_id, log.payload.get("employee_code"))
+            for log in logs
+            if log.payload.get("employee_code")
+        ]
+        employees_map: dict[tuple, Employee] = {}
+        if emp_keys:
+            corp_ids  = list({k[0] for k in emp_keys})
+            emp_codes = list({k[1] for k in emp_keys})
+            fetched = db.query(Employee).filter(
+                Employee.corporate_id.in_(corp_ids),
+                Employee.employee_code.in_(emp_codes),
+            ).all()
+            employees_map = {(e.corporate_id, e.employee_code): e for e in fetched}
+
+        # ── Per-record commit + isolation ─────────────────────────────────────
+        processed = 0
         for log in logs:
-            _process_single_log(db, log)
-        db.commit()
-        logger.info(f"Chunk complete: {len(logs)} logs processed.")
-        return f"Chunk processed: {len(logs)} records"
-    except Exception as exc:
-        db.rollback()
-        raise exc
+            try:
+                emp_code = log.payload.get("employee_code")
+                employee = employees_map.get((log.corporate_id, emp_code))
+                _process_single_log(db, log, employee=employee)
+                db.commit()
+                processed += 1
+            except Exception as exc:
+                db.rollback()
+                logger.error(f"Log {log.id} failed in chunk, rolled back: {exc}")
+
+        logger.info(f"Chunk complete: {processed}/{len(logs)} logs processed.")
+        return f"Chunk processed: {processed}/{len(logs)} records"
     finally:
         db.close()
 
@@ -392,6 +421,186 @@ def process_sync_event(self, log_id: int):
             except Exception:
                 db.rollback()
                 logger.error(f"Failed to persist FAILED state for log {log_id}")
+        raise
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Helpers for process_master_batch
+# ---------------------------------------------------------------------------
+
+def _parse_date(v):
+    """Convert ISO date string from Celery-serialised task args back to date object."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, _date):
+        return v
+    try:
+        return _date.fromisoformat(str(v))
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# process_master_batch  (Celery task)
+# Entry point for 202 Accepted batch uploads.  Called directly by the API
+# endpoint immediately after file parsing; the API returns to the client
+# while this task handles all DB writes and worker fan-out in the background.
+#
+# Flow:
+#   1. Bulk sync inserts — Employee upsert + SyncLog + SyncLogEvent (4 queries)
+#   2. Generate Excel outbound file for OFFLINE / BOTH channels
+#   3. Fan-out process_batch_chunk group
+# ---------------------------------------------------------------------------
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    autoretry_for=_RETRIABLE,
+    retry_backoff=True,
+    retry_jitter=True,
+)
+def process_master_batch(
+    self,
+    corporate_id: str,
+    rows: list,
+    event_type: str,
+    delivery_channel: str,
+    insurer_provider: str,
+    insurer_format: str,
+    base_folder: str,
+    is_deletion: bool = False,
+):
+    """
+    Master batch task dispatched by the 202 ingestion endpoints.
+    Rows arrive as JSON-safe dicts (dates as ISO strings, Decimals as strings)
+    because Celery serialises task args via JSON.
+    """
+    from datetime import datetime
+
+    db = SessionLocal()
+    try:
+        emp_codes = [r["employee_code"] for r in rows]
+        now = datetime.utcnow()
+
+        # ── Round-trip 1: Bulk SELECT existing employees ──────────────────────
+        existing = db.query(Employee).filter(
+            Employee.corporate_id == corporate_id,
+            Employee.employee_code.in_(emp_codes),
+        ).all()
+        emp_map = {e.employee_code: e for e in existing}
+
+        # ── Python-side: update existing / create new — zero extra DB hits ────
+        policy_status_map: dict = {}
+        for row in rows:
+            code = row["employee_code"]
+            emp = emp_map.get(code)
+            if emp:
+                ps = emp.policy_status
+                policy_status_map[code] = ps.value if hasattr(ps, "value") else str(ps) if ps else None
+                if is_deletion:
+                    emp.status = "inactive"
+                    emp.date_of_leaving = _parse_date(row.get("date_of_leaving"))
+                    emp.resignation_reason = row.get("reason")
+                else:
+                    emp.status = "active"
+                    emp.date_of_leaving = None
+                    emp.resignation_reason = None
+                    emp.first_name = row.get("first_name", emp.first_name)
+                    emp.last_name = row.get("last_name", emp.last_name)
+                    emp.email = row.get("email", emp.email)
+                    emp.gender = row.get("gender", emp.gender)
+                    emp.date_of_birth = _parse_date(row.get("date_of_birth")) or emp.date_of_birth
+                    emp.date_of_joining = _parse_date(row.get("date_of_joining")) or emp.date_of_joining
+                    emp.sum_insured = row.get("sum_insured", emp.sum_insured)
+            else:
+                policy_status_map[code] = None
+                db.add(Employee(
+                    corporate_id=corporate_id,
+                    employee_code=code,
+                    first_name=row.get("first_name") or "Unknown",
+                    last_name=row.get("last_name") or "Unknown",
+                    email=row.get("email"),
+                    gender=row.get("gender"),
+                    date_of_birth=_parse_date(row.get("date_of_birth")),
+                    status="inactive" if is_deletion else "active",
+                    delivery_status=SyncStatus.PENDING,
+                    policy_status=None,
+                    date_of_joining=_parse_date(row.get("date_of_joining")) if not is_deletion else None,
+                    date_of_leaving=_parse_date(row.get("date_of_leaving")) if is_deletion else None,
+                    resignation_reason=row.get("reason") if is_deletion else None,
+                    sum_insured=row.get("sum_insured", 0),
+                ))
+
+        # ── Round-trip 2: Flush all Employee inserts/updates ──────────────────
+        db.flush()
+
+        # ── Round-trip 3: Bulk INSERT SyncLogs, return IDs in one query ───────
+        log_rows = [
+            {
+                "corporate_id": corporate_id,
+                "transaction_id": row.get("transaction_id"),
+                "transaction_type": event_type,
+                "payload": json.loads(json.dumps(row, default=str)),
+                "source": SyncSource.BATCH,
+                "status": "success",
+                "sync_status": SyncStatus.PENDING,
+                "timestamp": now,
+            }
+            for row in rows
+        ]
+        insert_result = db.execute(
+            sa_insert(SyncLog).values(log_rows).returning(SyncLog.id)
+        )
+        log_ids = [r[0] for r in insert_result]
+
+        # ── Round-trip 4: Bulk INSERT SyncLogEvents ───────────────────────────
+        event_rows = [
+            {
+                "sync_log_id": log_id,
+                "event_status": SyncStatus.PENDING,
+                "actor": "SYSTEM_INGESTION",
+                "details": {"source": SyncSource.BATCH.value},
+                "policy_status": policy_status_map.get(row["employee_code"]),
+            }
+            for log_id, row in zip(log_ids, rows)
+        ]
+        db.execute(sa_insert(SyncLogEvent).values(event_rows))
+        db.commit()
+
+        # ── Generate Excel for OFFLINE / BOTH channels ────────────────────────
+        channel = DeliveryChannel(delivery_channel)
+        if channel in (DeliveryChannel.OFFLINE, DeliveryChannel.BOTH):
+            full_directory = os.path.join(BASE_PATH, base_folder)
+            filename_prefix = "removal_report" if is_deletion else "addition_report"
+            try:
+                OutboundTransformer.to_file(
+                    data=rows,
+                    filename_prefix=filename_prefix,
+                    output_dir=full_directory,
+                    format_type=insurer_format,
+                    insurer_adapter=get_insurer_adapter(insurer_provider),
+                    is_deletion=is_deletion,
+                )
+                logger.info(f"Excel generated for corporate {corporate_id} ({filename_prefix})")
+            except Exception as exc:
+                # Non-fatal: records are safely in DB; broker can re-generate via delivery endpoint.
+                logger.error(f"Excel generation failed for {corporate_id}: {exc}")
+
+        # ── Fan-out process_batch_chunk group ─────────────────────────────────
+        chunks = [log_ids[i:i + CHUNK_SIZE] for i in range(0, len(log_ids), CHUNK_SIZE)]
+        celery_group(process_batch_chunk.s(chunk) for chunk in chunks).apply_async()
+
+        logger.info(
+            f"Master batch complete: {len(log_ids)} records, {len(chunks)} chunk(s) dispatched "
+            f"for corporate {corporate_id}"
+        )
+        return {"corporate_id": corporate_id, "log_count": len(log_ids), "chunks": len(chunks)}
+
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"process_master_batch failed for {corporate_id}: {exc}")
         raise
     finally:
         db.close()

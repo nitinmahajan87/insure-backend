@@ -1,4 +1,5 @@
 import json
+from sqlalchemy import insert as sa_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from app.models.models import Employee, SyncLog, SyncStatus, SyncLogEvent, SyncSource
@@ -139,3 +140,111 @@ async def record_employee_event(
 
     await db.flush()
     return log # Return the log so the API can get the ID for process_sync_event.delay(log.id)
+
+
+async def bulk_record_batch_events(
+    db: AsyncSession,
+    corporate_id: str,
+    rows: list[dict],
+    event_type: str,
+    source: SyncSource,
+) -> list[int]:
+    """
+    High-throughput alternative to calling record_employee_event in a loop.
+    Processes an entire batch in 4 DB round-trips regardless of batch size.
+    Used exclusively by ingestion.py for BATCH_ADDITION / BATCH_DELETION events.
+    Returns a list of SyncLog IDs for Celery fan-out.
+    """
+    is_deletion = "DELETION" in event_type
+    emp_codes = [r["employee_code"] for r in rows]
+    now = datetime.utcnow()
+
+    # ── Round-trip 1: Bulk SELECT existing employees ──────────────────────────
+    result = await db.execute(
+        select(Employee).where(
+            Employee.corporate_id == corporate_id,
+            Employee.employee_code.in_(emp_codes),
+        )
+    )
+    emp_map: dict[str, Employee] = {e.employee_code: e for e in result.scalars()}
+
+    # ── Python-side: update existing / create new (zero additional DB hits) ───
+    # Capture policy_status snapshot for the audit event at the same time.
+    policy_status_map: dict[str, str | None] = {}
+
+    for row in rows:
+        code = row["employee_code"]
+        emp = emp_map.get(code)
+        if emp:
+            ps = emp.policy_status
+            policy_status_map[code] = ps.value if hasattr(ps, "value") else str(ps) if ps else None
+            if is_deletion:
+                emp.status = "inactive"
+                emp.date_of_leaving = row.get("date_of_leaving")
+                emp.resignation_reason = row.get("reason")
+            else:
+                emp.status = "active"
+                emp.date_of_leaving = None
+                emp.resignation_reason = None
+                emp.first_name = row.get("first_name", emp.first_name)
+                emp.last_name = row.get("last_name", emp.last_name)
+                emp.email = row.get("email", emp.email)
+                emp.gender = row.get("gender", emp.gender)
+                emp.date_of_birth = row.get("date_of_birth", emp.date_of_birth)
+                emp.date_of_joining = row.get("date_of_joining", emp.date_of_joining)
+                emp.sum_insured = row.get("sum_insured", emp.sum_insured)
+        else:
+            policy_status_map[code] = None  # new employee has no prior policy_status
+            db.add(Employee(
+                corporate_id=corporate_id,
+                employee_code=code,
+                first_name=row.get("first_name") or "Unknown",
+                last_name=row.get("last_name") or "Unknown",
+                email=row.get("email"),
+                gender=row.get("gender"),
+                date_of_birth=row.get("date_of_birth"),
+                status="inactive" if is_deletion else "active",
+                delivery_status=SyncStatus.PENDING,
+                policy_status=None,
+                date_of_joining=row.get("date_of_joining") if not is_deletion else None,
+                date_of_leaving=row.get("date_of_leaving") if is_deletion else None,
+                resignation_reason=row.get("reason") if is_deletion else None,
+                sum_insured=row.get("sum_insured", 0),
+            ))
+
+    # ── Round-trip 2: Flush all Employee inserts/updates in one shot ──────────
+    await db.flush()
+
+    # ── Round-trip 3: Bulk INSERT SyncLogs, return all IDs in one query ───────
+    log_rows = [
+        {
+            "corporate_id": corporate_id,
+            "transaction_id": row.get("transaction_id"),
+            "transaction_type": event_type,
+            "payload": json.loads(json.dumps(row, default=str)),
+            "source": source,
+            "status": "success",
+            "sync_status": SyncStatus.PENDING,
+            "timestamp": now,
+        }
+        for row in rows
+    ]
+    insert_result = await db.execute(
+        sa_insert(SyncLog).values(log_rows).returning(SyncLog.id)
+    )
+    log_ids = [r[0] for r in insert_result]
+
+    # ── Round-trip 4: Bulk INSERT SyncLogEvents ───────────────────────────────
+    event_rows = [
+        {
+            "sync_log_id": log_id,
+            "event_status": SyncStatus.PENDING,
+            "actor": "SYSTEM_INGESTION",
+            "details": {"source": source.value},
+            "policy_status": policy_status_map.get(row["employee_code"]),
+        }
+        for log_id, row in zip(log_ids, rows)
+    ]
+    await db.execute(sa_insert(SyncLogEvent).values(event_rows))
+
+    return log_ids

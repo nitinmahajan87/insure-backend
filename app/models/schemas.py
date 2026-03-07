@@ -116,6 +116,19 @@ class IngestionResponse(BaseModel):
     file_download_url: str
 
 
+class BatchAcceptedResponse(BaseModel):
+    """
+    202 Accepted response for batch uploads.
+    Returns parse results immediately; DB writes and Celery fan-out happen
+    in the background via process_master_batch.
+    """
+    filename:      str
+    accepted_count: int
+    rejected_count: int
+    message:       str
+    rejected_rows: List[RejectedRow]
+
+
 # ── Insurer Response File ─────────────────────────────────────────────────────
 # Schemas for processing the response Excel/CSV sent back by the insurer to the broker.
 
